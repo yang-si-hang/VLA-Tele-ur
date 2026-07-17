@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lerobot_robot_ur"
+version = "0.1.0"
+description = "LeRobot 0.6 integration for Universal Robots TCP pose control"
+requires-python = ">=3.12"
+dependencies = [
+    "lerobot>=0.6,<0.7",
+    "numpy>=2.0,<2.3",
+    "scipy>=1.14,<2",
+    "ur-rtde>=1.6.3,<2",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<9"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["lerobot_robot_ur*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
