@@ -1,4 +1,11 @@
-"""LeRobot 0.6 teleoperator integration for Force Dimension Sigma devices."""
+"""Expose Force Dimension Sigma motion through the LeRobot teleoperator API.
+
+``Sigma`` manages the low-level device lifecycle and converts each SDK pose
+into Cartesian position, rotation-vector, and gripper-angle action features.
+Configured scale, translation, base rotation, and tool rotation transforms are
+applied at the device-to-LeRobot boundary. A background zero-wrench refresh
+keeps force mode active without applying application haptic feedback.
+"""
 
 from __future__ import annotations
 

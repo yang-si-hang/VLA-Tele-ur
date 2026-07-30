@@ -1,11 +1,20 @@
-"""LeRobot 0.6 integration for Universal Robots TCP pose control."""
+"""Expose Universal Robots TCP pose control through the LeRobot robot API.
+
+``URRobot`` translates LeRobot observation and action dictionaries between
+Cartesian position plus 6D rotation features and the UR axis-angle TCP pose
+used by ``ur_rtde``. It delegates real-time arm streaming to ``URControl``,
+optionally drives a Robotiq gripper asynchronously, validates and limits pose
+steps, and manages both devices as one LeRobot connection.
+"""
 
 from __future__ import annotations
 
 import logging
 import math
+from collections import deque
+from concurrent.futures import Future
 from functools import cached_property
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 from lerobot.robots import Robot
@@ -14,14 +23,16 @@ from lerobot.utils.decorators import check_if_already_connected, check_if_not_co
 from scipy.spatial.transform import Rotation
 
 from .config_ur import URRobotConfig
-from .robotiq_gripper import RobotiqGripper
-from .ur_control import URControl
+from .robotiq_gripper_async import RobotiqGripper
+from .ur_control import URControl, rot6d_to_rotation, rotation_to_rot6d
 
 
 logger = logging.getLogger(__name__)
 
 
-TCP_FEATURES = ("ee.x", "ee.y", "ee.z", "ee.wx", "ee.wy", "ee.wz")  # rot vector: r = [wx, wy, wz], theta=||r||
+TCP_POSITION_FEATURES = ("ee.x", "ee.y", "ee.z")
+TCP_ROTATION_6D_FEATURES = ("ee.rot6d_0", "ee.rot6d_1", "ee.rot6d_2", "ee.rot6d_3", "ee.rot6d_4", "ee.rot6d_5")
+TCP_FEATURES = (*TCP_POSITION_FEATURES, *TCP_ROTATION_6D_FEATURES)
 GRIPPER_FEATURE = "ee.gripper_pos"
 
 
@@ -35,14 +46,17 @@ class URRobot(Robot):
         self.ur_control = URControl(
             config.robot_ip,
             rtde_frequency_hz=config.rtde_frequency_hz,
+            tcp_pose=config.tcp_pose,
             servo_lookahead_time=config.servo_lookahead_time,
             servo_gain=config.servo_gain,
             action_timeout_s=config.action_timeout_s,
             command_timeout_s=config.command_timeout_s,
+            check_pose_safety=config.check_pose_safety,
         )
         self.gripper: RobotiqGripper | None = None
         self._gripper_connected = False
         self._last_gripper_command: int | None = None
+        self._pending_gripper_commands: deque[Future[tuple[bool, int]]] = deque()
 
     @cached_property
     def observation_features(self) -> dict[str, type]:
@@ -63,11 +77,7 @@ class URRobot(Robot):
             return True
         if not self._gripper_connected or self.gripper is None:
             return False
-        socket = getattr(self.gripper, "socket", None)
-        try:
-            return socket is not None and socket.fileno() != -1
-        except OSError:
-            return False
+        return self.gripper.is_connected
 
     @check_if_already_connected
     def connect(self, calibrate: bool = True) -> None:
@@ -75,7 +85,14 @@ class URRobot(Robot):
         try:
             self.ur_control.connect()
             if self.config.use_gripper:
-                self.gripper = RobotiqGripper()
+                self.gripper = RobotiqGripper(
+                    position_poll_frequency_hz=(
+                        self.config.gripper_position_poll_frequency_hz
+                    ),
+                    status_poll_frequency_hz=(
+                        self.config.gripper_status_poll_frequency_hz
+                    ),
+                )
                 self.gripper.connect(self.config.robot_ip, self.config.gripper_port)
                 self._gripper_connected = True
                 self.gripper.activate(auto_calibrate=self.config.gripper_auto_calibrate)
@@ -99,15 +116,18 @@ class URRobot(Robot):
     @check_if_not_connected
     def get_observation(self) -> RobotObservation:
         tcp_pose = self.ur_control.get_tcp_pose()
-        observation: RobotObservation = {
-            name: float(value) for name, value in zip(TCP_FEATURES, tcp_pose, strict=True)
-        }
+        observation = self._tcp_pose_to_features(tcp_pose)
         if self.config.use_gripper:
+            self._check_pending_gripper_commands()
             observation[GRIPPER_FEATURE] = self._read_gripper_position()
         return observation
 
     @check_if_not_connected
-    def send_action(self, action: RobotAction) -> RobotAction:
+    def send_action(
+        self,
+        action: RobotAction,
+        current_observation: RobotObservation,
+    ) -> RobotAction:
         requested_pose = self._extract_tcp_pose(action)
 
         requested_gripper: float | None = None
@@ -117,12 +137,10 @@ class URRobot(Robot):
             requested_gripper = self._finite_float(action[GRIPPER_FEATURE], GRIPPER_FEATURE)
             requested_gripper = float(np.clip(requested_gripper, 0.0, 1.0))
 
-        current_pose = self.ur_control.get_tcp_pose()
+        current_pose = self._extract_tcp_pose(current_observation)
         safe_pose = self._limit_tcp_step(current_pose, requested_pose)
         sent_pose = self.ur_control.set_tcp_pose(safe_pose)
-        sent_action: RobotAction = {
-            name: float(value) for name, value in zip(TCP_FEATURES, sent_pose, strict=True)
-        }
+        sent_action = self._tcp_pose_to_features(sent_pose)
 
         if requested_gripper is not None:
             sent_action[GRIPPER_FEATURE] = self._send_gripper_position(requested_gripper)
@@ -136,9 +154,33 @@ class URRobot(Robot):
         missing = [name for name in TCP_FEATURES if name not in action]
         if missing:
             raise ValueError(f"Action is missing required TCP pose keys: {missing}")
-        return [self._finite_float(action[name], name) for name in TCP_FEATURES]
 
-    def _limit_tcp_step(self, current_pose: list[float], target_pose: list[float]) -> list[float]:  # TODO: 计算逻辑
+        position = [
+            self._finite_float(action[name], name) for name in TCP_POSITION_FEATURES
+        ]
+        rot6d = [
+            self._finite_float(action[name], name) for name in TCP_ROTATION_6D_FEATURES
+        ]
+        try:
+            rotation_vector = rot6d_to_rotation(rot6d).as_rotvec()
+        except ValueError as exc:
+            raise ValueError("Action contains an invalid Rot6D orientation") from exc
+        return [*position, *rotation_vector.tolist()]
+
+    @staticmethod
+    def _tcp_pose_to_features(tcp_pose: Sequence[float]) -> RobotAction:
+        values = np.asarray(tcp_pose, dtype=np.float64)
+        if values.shape != (6,) or not np.all(np.isfinite(values)):
+            raise ValueError("TCP pose must contain 6 finite values")
+
+        rot6d = rotation_to_rot6d(Rotation.from_rotvec(values[3:]))
+        feature_values = np.concatenate((values[:3], rot6d))
+        return {
+            name: float(value)
+            for name, value in zip(TCP_FEATURES, feature_values, strict=True)
+        }
+
+    def _limit_tcp_step(self, current_pose: list[float], target_pose: list[float]) -> list[float]:
         current = np.asarray(current_pose, dtype=np.float64)
         target = np.asarray(target_pose, dtype=np.float64)
         limited = target.copy()
@@ -175,23 +217,48 @@ class URRobot(Robot):
     def _read_gripper_position(self) -> float:
         if self.gripper is None:
             raise RuntimeError("Robotiq gripper is not available")
-        return self._raw_gripper_to_normalized(self.gripper.get_current_position())
+        worker_error = self.gripper.get_last_error()
+        if worker_error is not None:
+            raise RuntimeError("Robotiq gripper worker failed") from worker_error
+        raw_position = self.gripper.get_cached_position(
+            max_age_s=self.config.gripper_cache_max_age_s
+        )
+        if raw_position is None:
+            raise RuntimeError(
+                "Robotiq gripper position cache is unavailable or stale"
+            )
+        return self._raw_gripper_to_normalized(raw_position)
 
     def _send_gripper_position(self, normalized_position: float) -> float:
         if self.gripper is None:
             raise RuntimeError("Robotiq gripper is not available")
+        self._check_pending_gripper_commands()
         raw_position = self._normalized_gripper_to_raw(normalized_position)
-        actual_raw_position = raw_position
         if raw_position != self._last_gripper_command:
-            acknowledged, actual_raw_position = self.gripper.move(
+            future = self.gripper.move_async(
                 raw_position,
                 self.config.gripper_speed,
                 self.config.gripper_force,
             )
+            self._pending_gripper_commands.append(future)
+            self._last_gripper_command = raw_position
+        return self._raw_gripper_to_normalized(raw_position)
+
+    def _check_pending_gripper_commands(self) -> None:
+        pending_count = len(self._pending_gripper_commands)
+        for _ in range(pending_count):
+            future = self._pending_gripper_commands.popleft()
+            if future.cancelled():
+                continue
+            if not future.done():
+                self._pending_gripper_commands.append(future)
+                continue
+            try:
+                acknowledged, _ = future.result()
+            except BaseException as exc:
+                raise RuntimeError("Asynchronous Robotiq command failed") from exc
             if not acknowledged:
                 raise RuntimeError("Robotiq gripper did not acknowledge the move command")
-            self._last_gripper_command = actual_raw_position
-        return self._raw_gripper_to_normalized(actual_raw_position)
 
     def _normalized_gripper_to_raw(self, normalized_position: float) -> int:
         minimum, maximum = self._gripper_range()
@@ -224,6 +291,7 @@ class URRobot(Robot):
                 errors.append(exc)
         self._gripper_connected = False
         self._last_gripper_command = None
+        self._pending_gripper_commands.clear()
         self.gripper = None
 
         if errors and raise_errors:

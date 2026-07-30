@@ -1,9 +1,16 @@
-"""Small pyorbbecSDK adapter used by the LeRobot-facing camera class."""
+"""Adapt ``pyorbbecSDK`` device and color-stream operations for LeRobot.
+
+The helpers enumerate cameras, select a device by serial number or name, match
+an exact RGB stream profile, validate and apply supported color properties, and
+convert SDK color frames into NumPy RGB arrays. ``OrbbecColorStream`` owns the
+SDK pipeline lifecycle so the LeRobot-facing adapter can remain independent of
+SDK object details.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping
 
 import cv2
 import numpy as np
@@ -23,6 +30,98 @@ class ColorProfile:
     height: int
     fps: int
     format_name: str
+
+
+_COLOR_SETTING_PROPERTIES = {
+    "auto_exposure": (ob.OBPropertyID.OB_PROP_COLOR_AUTO_EXPOSURE_BOOL, bool),
+    "auto_exposure_priority": (
+        ob.OBPropertyID.OB_PROP_COLOR_AUTO_EXPOSURE_PRIORITY_INT,
+        int,
+    ),
+    "anti_flicker": (ob.OBPropertyID.OB_PROP_COLOR_ANTI_FLICKER_BOOL, bool),
+    "power_line_frequency": (
+        ob.OBPropertyID.OB_PROP_COLOR_POWER_LINE_FREQUENCY_INT,
+        int,
+    ),
+    "backlight_compensation": (
+        ob.OBPropertyID.OB_PROP_COLOR_BACKLIGHT_COMPENSATION_INT,
+        int,
+    ),
+    "exposure": (ob.OBPropertyID.OB_PROP_COLOR_EXPOSURE_INT, int),
+    "gain": (ob.OBPropertyID.OB_PROP_COLOR_GAIN_INT, int),
+    "auto_white_balance": (ob.OBPropertyID.OB_PROP_COLOR_AUTO_WHITE_BALANCE_BOOL, bool),
+    "white_balance": (ob.OBPropertyID.OB_PROP_COLOR_WHITE_BALANCE_INT, int),
+}
+
+
+def set_device_color_settings(
+    device: Any,
+    settings: Mapping[str, bool | int],
+) -> dict[str, bool | int]:
+    """Set supported color properties and return their device readback values."""
+
+    unknown = settings.keys() - _COLOR_SETTING_PROPERTIES.keys()
+    if unknown:
+        names = ", ".join(sorted(unknown))
+        raise ValueError(f"Unknown Orbbec color settings: {names}.")
+
+    applied: dict[str, bool | int] = {}
+    for name, (property_id, value_type) in _COLOR_SETTING_PROPERTIES.items():
+        if name not in settings:
+            continue
+        value = settings[name]
+        if value_type is bool:
+            if not isinstance(value, bool):
+                raise ValueError(f"Orbbec color setting `{name}` must be a boolean.")
+        elif isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"Orbbec color setting `{name}` must be an integer.")
+
+        if not device.is_property_supported(property_id, ob.OBPermissionType.PERMISSION_WRITE):
+            raise RuntimeError(f"Orbbec device does not support writing color setting `{name}`.")
+        if not device.is_property_supported(property_id, ob.OBPermissionType.PERMISSION_READ):
+            raise RuntimeError(f"Orbbec device does not support reading color setting `{name}`.")
+
+        if value_type is bool:
+            device.set_bool_property(property_id, value)
+            actual = device.get_bool_property(property_id)
+        else:
+            value_range = device.get_int_property_range(property_id)
+            if value < value_range.min or value > value_range.max:
+                raise ValueError(
+                    f"Orbbec color setting `{name}`={value} is outside the supported range "
+                    f"[{value_range.min}, {value_range.max}]."
+                )
+            if value_range.step > 0 and (value - value_range.min) % value_range.step != 0:
+                raise ValueError(
+                    f"Orbbec color setting `{name}`={value} does not match step "
+                    f"{value_range.step} from minimum {value_range.min}."
+                )
+            device.set_int_property(property_id, value)
+            actual = device.get_int_property(property_id)
+
+        if actual != value:
+            raise RuntimeError(
+                f"Orbbec color setting `{name}` read back as {actual}, expected {value}."
+            )
+        applied[name] = actual
+
+    # Some ISP controls can affect related properties. Verify the complete
+    # configuration once more after every requested value has been written.
+    for name, (property_id, value_type) in _COLOR_SETTING_PROPERTIES.items():
+        if name not in settings:
+            continue
+        expected = settings[name]
+        if value_type is bool:
+            actual = device.get_bool_property(property_id)
+        else:
+            actual = device.get_int_property(property_id)
+        if actual != expected:
+            raise RuntimeError(
+                f"Orbbec color setting `{name}` changed to {actual} after configuration, "
+                f"expected {expected}."
+            )
+
+    return applied
 
 
 def _format_name(value: Any) -> str:
@@ -213,6 +312,16 @@ class OrbbecColorStream:
         if frame is None:
             return None
         return self._frame_to_rgb(frame)
+
+    def set_color_settings(
+        self,
+        settings: Mapping[str, bool | int],
+    ) -> dict[str, bool | int]:
+        """Apply color controls after the stream has started."""
+
+        if not self.is_started or self._device is None:
+            raise RuntimeError("Orbbec color stream is not started.")
+        return set_device_color_settings(self._device, settings)
 
     @staticmethod
     def _frame_to_rgb(frame: Any) -> NDArray[np.uint8]:

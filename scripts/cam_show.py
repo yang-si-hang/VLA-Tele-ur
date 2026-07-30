@@ -3,12 +3,42 @@
 import cv2
 import numpy as np
 import pyorbbecsdk as ob
+from lerobot_camera_orbbec.orbbec_utils import set_device_color_settings
 
 
-WIDTH = 1280
-HEIGHT = 720
-FPS = 30
+WIDTH = 640
+HEIGHT = 480
+FPS = 60
 FRAME_TIMEOUT_MS = 1000
+
+# gemini 305
+# # Edit these values and restart the script to compare the captured image.
+# # Gemini 305 and 336 commonly support exposure 1-1990/1665, gain 16-248,
+# # white balance 2800-6500, and backlight compensation 0-6.
+# AUTO_EXPOSURE = False
+# EXPOSURE = 155
+# GAIN = 35
+# AUTO_WHITE_BALANCE = False
+# WHITE_BALANCE = 3700
+# AUTO_EXPOSURE_PRIORITY = 0
+# ANTI_FLICKER = False
+# # 0 disables power-line compensation, 1 selects 50 Hz, and 2 selects 60 Hz.
+# POWER_LINE_FREQUENCY = 1
+# BACKLIGHT_COMPENSATION = 0
+
+# Edit these values and restart the script to compare the captured image.
+# Gemini 305 and 336 commonly support exposure 1-1990/1665, gain 16-248,
+# white balance 2800-6500, and backlight compensation 0-6.
+AUTO_EXPOSURE = False
+EXPOSURE = 160
+GAIN = 19
+AUTO_WHITE_BALANCE = False
+WHITE_BALANCE = 4200
+AUTO_EXPOSURE_PRIORITY = 0
+ANTI_FLICKER = False
+# 0 disables power-line compensation, 1 selects 50 Hz, and 2 selects 60 Hz.
+POWER_LINE_FREQUENCY = 1
+BACKLIGHT_COMPENSATION = 0
 
 
 def select_color_profile(pipeline):
@@ -27,7 +57,7 @@ def select_color_profile(pipeline):
             ):
                 return profile
 
-    print(f"警告：相机不支持 {WIDTH}x{HEIGHT}@{FPS} RGB/MJPG，使用默认彩色配置")
+    print(f"Warning: {WIDTH}x{HEIGHT}@{FPS} RGB/MJPG is unavailable, using the default profile")
     return profiles.get_default_video_stream_profile()
 
 
@@ -49,7 +79,7 @@ def color_frame_to_bgr(frame):
     if frame_format == ob.OBFormat.MJPG:
         image = cv2.imdecode(data, cv2.IMREAD_COLOR)
         if image is None:
-            raise RuntimeError("OpenCV 无法解码 MJPG 彩色帧")
+            raise RuntimeError("OpenCV failed to decode the MJPG color frame")
         return image
     if frame_format in (ob.OBFormat.YUYV, ob.OBFormat.YUY2):
         return cv2.cvtColor(
@@ -60,16 +90,16 @@ def color_frame_to_bgr(frame):
             data.reshape(height, width, 2), cv2.COLOR_YUV2BGR_UYVY
         )
 
-    raise RuntimeError(f"不支持的彩色图像格式：{frame_format}")
+    raise RuntimeError(f"Unsupported color frame format: {frame_format}")
 
 
 def main():
     context = ob.Context()
     device_list = context.query_devices()
     if device_list.get_count() == 0:
-        raise RuntimeError("未检测到 Orbbec 相机，请检查 USB 连接和设备权限")
+        raise RuntimeError("No Orbbec camera detected, check the USB connection and permissions")
 
-    device = device_list.get_device_by_index(0)
+    device = device_list.get_device_by_index(1)
     device_info = device.get_device_info()
     pipeline = ob.Pipeline(device)
     config = ob.Config()
@@ -77,18 +107,32 @@ def main():
     config.enable_stream(color_profile)
 
     pipeline.start(config)
-    print(
-        f"已打开 {device_info.get_name()} ({device_info.get_serial_number()})："
-        f"{color_profile.get_width()}x{color_profile.get_height()}@"
-        f"{color_profile.get_fps()}，格式 {color_profile.get_format()}"
-    )
-    print("按 q 或 Esc 键退出")
-
     try:
+        color_settings = {
+            "auto_exposure": AUTO_EXPOSURE,
+            "exposure": EXPOSURE,
+            "gain": GAIN,
+            "auto_white_balance": AUTO_WHITE_BALANCE,
+            "white_balance": WHITE_BALANCE,
+            "auto_exposure_priority": AUTO_EXPOSURE_PRIORITY,
+            "anti_flicker": ANTI_FLICKER,
+            "power_line_frequency": POWER_LINE_FREQUENCY,
+            "backlight_compensation": BACKLIGHT_COMPENSATION,
+        }
+        applied_settings = set_device_color_settings(device, color_settings)
+
+        print(
+            f"Opened {device_info.get_name()} ({device_info.get_serial_number()}): "
+            f"{color_profile.get_width()}x{color_profile.get_height()}@"
+            f"{color_profile.get_fps()}, format={color_profile.get_format()}"
+        )
+        print(f"Applied color settings: {applied_settings}")
+        print("Press q or Esc to exit")
+
         while True:
             frames = pipeline.wait_for_frames(FRAME_TIMEOUT_MS)
             if frames is None:
-                print("警告：等待图像帧超时")
+                print("Warning: timed out waiting for a color frame")
                 continue
 
             color_frame = frames.get_color_frame()

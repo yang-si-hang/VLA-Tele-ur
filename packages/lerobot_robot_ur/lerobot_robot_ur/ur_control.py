@@ -1,4 +1,12 @@
-"""Low-level TCP pose control for Universal Robots through ``ur_rtde``."""
+"""Implement low-level Universal Robots TCP pose streaming through ``ur_rtde``.
+
+``URControl`` owns the RTDE receive and control interfaces and confines all
+runtime control calls to a dedicated servo thread. Public pose commands are
+validated, placed in a latest-value queue, checked with the controller's pose
+safety API, and streamed with ``servoL`` until stale or disconnected. Rotation
+helpers convert between UR axis-angle values and LeRobot's continuous 6D
+representation.
+"""
 
 from __future__ import annotations
 
@@ -10,11 +18,47 @@ import time
 from dataclasses import dataclass, field
 from typing import Sequence
 
+import numpy as np
 import rtde_control
 import rtde_receive
+from scipy.spatial.transform import Rotation
 
 
 logger = logging.getLogger(__name__)
+
+
+def rotation_to_rot6d(rotation: Rotation) -> np.ndarray:
+    """Encode a single rotation using the first two columns of its matrix."""
+
+    matrix = rotation.as_matrix()
+    if matrix.shape != (3, 3):
+        raise ValueError("Expected a single rotation")
+    return np.concatenate((matrix[:, 0], matrix[:, 1]))
+
+
+def rot6d_to_rotation(rot6d: Sequence[float]) -> Rotation:
+    """Decode a 6D rotation with Gram-Schmidt orthonormalization."""
+
+    values = np.asarray(rot6d, dtype=np.float64)
+    if values.shape != (6,):
+        raise ValueError(f"Rot6D must contain 6 values, got shape {values.shape}")
+    if not np.all(np.isfinite(values)):
+        raise ValueError("Rot6D values must be finite")
+
+    first = values[:3]
+    first_norm = float(np.linalg.norm(first))
+    if first_norm < 1e-8:
+        raise ValueError("Rot6D first direction must be non-zero")
+    first = first / first_norm
+
+    second = values[3:] - np.dot(first, values[3:]) * first
+    second_norm = float(np.linalg.norm(second))
+    if second_norm < 1e-8:
+        raise ValueError("Rot6D directions must not be parallel")
+    second = second / second_norm
+
+    third = np.cross(first, second)
+    return Rotation.from_matrix(np.column_stack((first, second, third)))
 
 
 @dataclass(slots=True)
@@ -39,17 +83,21 @@ class URControl:
         robot_ip: str,
         *,
         rtde_frequency_hz: float | None = None,
+        tcp_pose: Sequence[float] = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
         servo_lookahead_time: float = 0.1,
         servo_gain: float = 600.0,
         action_timeout_s: float = 0.25,
         command_timeout_s: float = 1.0,
+        check_pose_safety: bool = True,
     ) -> None:
         self.robot_ip = robot_ip
         self.rtde_frequency_hz = rtde_frequency_hz
+        self.tcp_pose = self._validate_pose(tcp_pose, name="TCP offset pose")
         self.servo_lookahead_time = servo_lookahead_time
         self.servo_gain = servo_gain
         self.action_timeout_s = action_timeout_s
         self.command_timeout_s = command_timeout_s
+        self.check_pose_safety = check_pose_safety
 
         self._rtde_c = None
         self._rtde_r = None
@@ -92,6 +140,8 @@ class URControl:
 
             if not self._rtde_r.isConnected() or not self._rtde_c.isConnected():
                 raise ConnectionError(f"Failed to connect RTDE interfaces to {self.robot_ip}")
+            if not self._rtde_c.setTcp(self.tcp_pose):
+                raise RuntimeError("Failed to set UR TCP offset pose")
 
             with self._state_lock:
                 self._receive_connected = True
@@ -200,7 +250,12 @@ class URControl:
                     if current_command.cancelled.is_set():
                         current_command.error = TimeoutError("TCP pose command was cancelled")
                         current_command.done.set()
-                    elif not self._rtde_c.isPoseWithinSafetyLimits(current_command.pose):
+                    elif (
+                        self.check_pose_safety
+                        and not self._rtde_c.isPoseWithinSafetyLimits(
+                            current_command.pose
+                        )
+                    ):
                         current_command.error = ValueError(
                             "Target TCP pose is unreachable or outside UR safety limits"
                         )

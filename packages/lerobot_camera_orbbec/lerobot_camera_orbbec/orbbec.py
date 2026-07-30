@@ -1,4 +1,11 @@
-"""LeRobot 0.6 camera implementation for Orbbec Gemini cameras."""
+"""Expose Orbbec Gemini RGB capture through the LeRobot camera API.
+
+``OrbbecCamera`` selects and configures an exact SDK color profile, then uses a
+single background thread for blocking frame acquisition. Synchronous and
+asynchronous LeRobot reads consume the newest buffered frame, while
+``read_latest`` returns a fresh snapshot without consuming it. Captured images
+are converted to the configured color mode and rotation before publication.
+"""
 
 from __future__ import annotations
 
@@ -38,6 +45,8 @@ class OrbbecCamera(Camera):
         self.serial_number: str | None = None
         self.color_mode = config.color_mode
         self.warmup_s = config.warmup_s
+        self.color_settings = config.color_settings
+        self.applied_color_settings: dict[str, bool | int] = {}
         self.rotation: int | None = get_cv2_rotation(config.rotation)
 
         if self.width is None or self.height is None or self.fps is None:
@@ -85,6 +94,8 @@ class OrbbecCamera(Camera):
             )
             self._stream = stream
             self.serial_number = stream.serial_number
+            if self.color_settings:
+                self.applied_color_settings = stream.set_color_settings(self.color_settings)
 
             if (
                 profile.width != self.capture_width
@@ -104,6 +115,7 @@ class OrbbecCamera(Camera):
             stream.stop()
             self._stream = None
             self.serial_number = None
+            self.applied_color_settings = {}
             if isinstance(exc, (ValueError, RuntimeError, ConnectionError)):
                 raise
             raise ConnectionError(f"Failed to connect {self}: {exc}") from exc
@@ -116,6 +128,8 @@ class OrbbecCamera(Camera):
             self.fps,
             profile.format_name,
         )
+        if self.applied_color_settings:
+            logger.info("%s applied color settings: %s", self, self.applied_color_settings)
 
     def _warmup(self) -> None:
         """Wait for a first frame, then keep consuming during the warmup period."""
@@ -234,10 +248,7 @@ class OrbbecCamera(Camera):
     def read(self) -> NDArray[Any]:
         """Block until a new RGB/BGR frame is available."""
 
-        start = time.perf_counter()
-        frame = self.async_read(timeout_ms=10_000)
-        logger.debug("%s read took %.1f ms", self, (time.perf_counter() - start) * 1000.0)
-        return frame
+        return self.async_read(timeout_ms=10_000)
 
     @check_if_not_connected
     def async_read(self, timeout_ms: float = 200) -> NDArray[Any]:
@@ -294,6 +305,7 @@ class OrbbecCamera(Camera):
         stream = self._stream
         self._stream = None
         self.serial_number = None
+        self.applied_color_settings = {}
         if stream is not None:
             stream.stop()
         logger.info("%s disconnected.", self)

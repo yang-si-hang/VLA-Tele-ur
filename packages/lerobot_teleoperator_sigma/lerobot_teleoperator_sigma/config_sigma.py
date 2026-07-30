@@ -1,4 +1,11 @@
-"""Configuration for the Force Dimension Sigma teleoperator."""
+"""Define and validate configuration for the LeRobot Sigma teleoperator.
+
+``SigmaConfig`` is registered under the ``sigma`` teleoperator type and
+collects SDK loading, device selection, force-refresh, gravity-compensation,
+position scaling, and coordinate-frame transform settings. Validation enforces
+an unambiguous device selector and finite transform values before hardware is
+opened.
+"""
 
 from __future__ import annotations
 
@@ -16,7 +23,8 @@ class SigmaConfig(TeleoperatorConfig):
 
     The Force Dimension SDK reports position in metres and orientation as a
     rotation matrix in the device base frame. ``Sigma`` converts the matrix to
-    the rotation-vector representation used by ``lerobot_robot_ur``.
+    a rotation vector. Robot-specific processors convert that representation at
+    the teleoperator-to-robot boundary.
 
     The configured rigid transforms are applied as::
 

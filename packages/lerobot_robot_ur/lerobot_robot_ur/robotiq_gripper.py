@@ -1,4 +1,11 @@
-"""Module to control Robotiq's grippers - tested with HAND-E"""
+"""Provide synchronous socket control for a Robotiq gripper.
+
+The driver implements Robotiq's ASCII variable protocol over TCP, serializes
+each request-response exchange with a lock, and exposes activation,
+calibration, position queries, and blocking motion helpers. It has been tested
+with the Robotiq Hand-E and serves as the straightforward synchronous protocol
+implementation alongside the threaded runtime driver.
+"""
 
 import socket
 import threading

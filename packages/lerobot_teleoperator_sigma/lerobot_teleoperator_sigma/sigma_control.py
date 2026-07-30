@@ -1,8 +1,10 @@
-"""Force Dimension Sigma access through ``forcedimension_core``.
+"""Implement low-level Force Dimension Sigma access with ``forcedimension_core``.
 
-This module provides DHD connection, pose-reading, device-mode configuration,
-gravity-compensation configuration, and zero-wrench commands. It does not send
-non-zero application force, torque, gripper, or robotic position commands.
+``SigmaDevice`` loads the configured SDK, selects and validates one device,
+owns its DHD connection, and provides thread-safe pose, gripper, status, mode,
+and gravity-compensation operations. A dedicated refresh thread repeatedly
+sends a zero force/torque/gripper wrench required by force mode. The module
+never sends non-zero haptic feedback or robot position commands.
 """
 
 from __future__ import annotations
@@ -296,11 +298,6 @@ class SigmaDevice:
             )
             self._force_refresh_thread = thread
             thread.start()
-
-        logger.info(
-            "Sigma force refresh loop started at %.1f Hz",
-            self.force_refresh_frequency_hz,
-        )
 
     def stop_force_refresh(self) -> None:
         """Stop and join the background zero-wrench refresh loop."""
