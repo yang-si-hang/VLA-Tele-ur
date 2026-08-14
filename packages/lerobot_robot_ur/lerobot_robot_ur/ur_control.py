@@ -2,10 +2,10 @@
 
 ``URControl`` owns the RTDE receive and control interfaces and confines all
 runtime control calls to a dedicated servo thread. Public pose commands are
-validated, placed in a latest-value queue, checked with the controller's pose
-safety API, and streamed with ``servoL`` until stale or disconnected. Rotation
-helpers convert between UR axis-angle values and LeRobot's continuous 6D
-representation.
+validated, placed in a bounded FIFO command queue, checked with the controller's
+pose safety API, and streamed with ``servoL`` until stale or disconnected.
+Rotation helpers convert between UR axis-angle values and LeRobot's continuous
+6D representation.
 """
 
 from __future__ import annotations
@@ -69,13 +69,20 @@ class _PoseCommand:
     error: BaseException | None = None
 
 
+@dataclass(slots=True)
+class _MoveLCommand(_PoseCommand):
+    speed: float = 0.25
+    acceleration: float = 0.5
+
+
 class URControl:
-    """Own RTDE control/receive interfaces and stream the latest TCP target.
+    """Own RTDE control/receive interfaces and stream TCP targets.
 
     ``RTDEControlInterface`` is not thread-safe. All of its runtime control
     methods are therefore confined to the servo thread. Public callers submit
-    commands through a queue and wait until the first ``servoL`` call has been
-    acknowledged.
+    commands through a capacity-one FIFO queue. A queued command is never
+    replaced by a newer command: producers wait for queue space, then wait until
+    the command's first ``servoL`` call has been acknowledged.
     """
 
     def __init__(
@@ -101,7 +108,12 @@ class URControl:
 
         self._rtde_c = None
         self._rtde_r = None
-        self._command_queue: queue.Queue[_PoseCommand] = queue.Queue(maxsize=1)
+        # Future streaming design: replace this FIFO with a lock-protected
+        # latest-target slot so a new servo target supersedes a pending stale
+        # target. Give commands sequence IDs and explicitly acknowledge executed
+        # versus superseded commands so synchronous callers cannot wait forever
+        # or mistake another target's servoL acknowledgement for their own.
+        self._command_queue: queue.Queue[_PoseCommand | _MoveLCommand] = queue.Queue(maxsize=1)
         self._stop_event = threading.Event()
         self._thread_started = threading.Event()
         self._control_thread: threading.Thread | None = None
@@ -188,6 +200,30 @@ class URControl:
         self._raise_if_thread_failed()
         return target
 
+    def move_tcp_pose(self, pose: Sequence[float], *, speed: float = 0.25, acceleration: float = 0.5) -> list[float]:
+        """Move linearly to one TCP pose with RTDE moveL."""
+
+        self._require_connected()
+        target = self._validate_pose(pose, name="moveL target TCP pose")
+        if not math.isfinite(speed) or speed <= 0:
+            raise ValueError("moveL speed must be finite and positive")
+        if not math.isfinite(acceleration) or acceleration <= 0:
+            raise ValueError("moveL acceleration must be finite and positive")
+        command = _MoveLCommand(target, speed=float(speed), acceleration=float(acceleration))
+
+        try:
+            self._command_queue.put(command, timeout=self.command_timeout_s)
+        except queue.Full as exc:
+            self._raise_if_thread_failed()
+            raise TimeoutError("Timed out while queueing a UR moveL command") from exc
+
+        while not command.done.wait(timeout=self.command_timeout_s):
+            self._raise_if_thread_failed()
+        if command.error is not None:
+            raise RuntimeError("Failed to execute UR moveL command") from command.error
+        self._raise_if_thread_failed()
+        return target
+
     def disconnect(self) -> None:
         errors: list[BaseException] = []
         self._stop_event.set()
@@ -235,16 +271,39 @@ class URControl:
         current_command: _PoseCommand | None = None
 
         try:
-            step_time = self._wait_for_step_time()
+            step_time = self._wait_for_step_time()      # control frequency loop time
             self._thread_started.set()
 
             while not self._stop_event.is_set():
-                cycle_start = self._rtde_c.initPeriod()
                 try:
                     current_command = self._command_queue.get_nowait()
                 except queue.Empty:
                     current_command = None
 
+                if isinstance(current_command, _MoveLCommand):
+                    if servo_active:
+                        self._rtde_c.servoStop()
+                    servo_active = False
+                    active_pose = None
+                    last_command_time = None
+                    if (
+                        self.check_pose_safety
+                        and not self._rtde_c.isPoseWithinSafetyLimits(current_command.pose)
+                    ):
+                        current_command.error = ValueError(
+                            "moveL target TCP pose is unreachable or outside UR safety limits"
+                        )
+                    elif not self._rtde_c.moveL(
+                        current_command.pose,
+                        current_command.speed,
+                        current_command.acceleration,
+                    ):
+                        current_command.error = RuntimeError("moveL returned False")
+                    current_command.done.set()
+                    current_command = None
+                    continue
+
+                cycle_start = self._rtde_c.initPeriod()
                 command_accepted = False
                 if current_command is not None:
                     if current_command.cancelled.is_set():

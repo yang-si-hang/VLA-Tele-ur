@@ -10,6 +10,7 @@ requires-python = ">=3.12"
 dependencies = [
     "lerobot>=0.6,<0.7",
     "numpy>=2.0,<2.3",
+    "pyserial>=3.5,<4",
     "scipy>=1.14,<2",
     "ur-rtde>=1.6.3,<2",
 ]
