@@ -29,7 +29,13 @@ from scipy.spatial.transform import Rotation
 
 from lerobot_robot_ur import URRobot, URRobotConfig
 from lerobot_robot_ur.ur import GRIPPER_FEATURE, TCP_FEATURES
-from lerobot_teleoperator_sigma import GRIPPER_ANGLE_FEATURE, Sigma, SigmaConfig
+from lerobot_robot_ur.ur_control import rot6d_to_rotation, rotation_to_rot6d
+from lerobot_teleoperator_sigma import (
+    GRIPPER_ANGLE_FEATURE,
+    POSE_FEATURES as SIGMA_POSE_FEATURES,
+    Sigma,
+    SigmaConfig,
+)
 
 
 root_logger = logging.getLogger()
@@ -45,8 +51,8 @@ if not root_logger.handlers:
     root_logger.addHandler(console_handler)
 
 
-POSITION_SCALE = 1.0
-SIGMA_TO_UR_BASE_ROTATION_RAD = (0.0, 0.0, np.pi / 2) # sigma in UR base frame: Sigma X->UR Y, Sigma Y->UR -X
+POSITION_SCALE = 1.5
+SIGMA_TO_UR_BASE_ROTATION_RAD = (0.0, 0.0, np.pi) # sigma in UR base frame: Sigma X->UR Y, Sigma Y->UR -X
 CONTROL_FREQUENCY_HZ = 50.0
 REFERENCE_SAMPLE_COUNT = 20
 # The connected right-hand sigma.7 reports an expected gripper joint range of
@@ -54,12 +60,6 @@ REFERENCE_SAMPLE_COUNT = 20
 # left-hand device, so the mapping below operates on angle magnitude.
 SIGMA_GRIPPER_CLOSED_ANGLE_RAD = 0.0
 SIGMA_GRIPPER_OPEN_ANGLE_RAD = 0.5315
-
-# Total motion limits relative to the captured UR reference pose. These are in
-# addition to URRobot's per-command translation and rotation step limits.
-MAX_RELATIVE_TRANSLATION_M = 0.25
-MAX_RELATIVE_ROTATION_RAD = math.pi / 2
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Control a UR10e from a Sigma using relative Cartesian poses.")
@@ -84,9 +84,7 @@ def parse_args() -> argparse.Namespace:
     # Control-loop timing.
     parser.add_argument("--fps", type=float, default=CONTROL_FREQUENCY_HZ, help="Outer teleoperation command frequency")
 
-    # Workspace and per-command safety limits.
-    parser.add_argument("--max-relative-translation-m", type=float, default=MAX_RELATIVE_TRANSLATION_M, help="Maximum TCP displacement from the captured UR start position")
-    parser.add_argument("--max-relative-rotation-rad", type=float, default=MAX_RELATIVE_ROTATION_RAD, help="Maximum TCP orientation change from the captured UR start orientation")
+    # Per-command safety limits.
     parser.add_argument("--max-command-translation-m", type=float, default=0.05, help="URRobot maximum translation step for each outer-loop command")
     parser.add_argument("--max-command-rotation-rad", type=float, default=0.2, help="URRobot maximum rotation step for each outer-loop command")
 
@@ -116,8 +114,6 @@ def parse_args() -> argparse.Namespace:
             "--sigma-gripper-closed-angle-rad"
         )
     for name in (
-        "max_relative_translation_m",
-        "max_relative_rotation_rad",
         "max_command_translation_m",
         "max_command_rotation_rad",
     ):
@@ -138,22 +134,38 @@ class CartesianPose:
 
 
 def action_to_pose(action: dict[str, Any]) -> CartesianPose:
-    """Convert LeRobot's UR-compatible action dictionary to a Cartesian pose."""
+    """Convert a UR xyz plus Rot6D action dictionary to a Cartesian pose."""
 
     missing = [name for name in TCP_FEATURES if name not in action]
     if missing:
         raise ValueError(f"Pose action is missing required keys: {missing}")
 
     values = np.asarray([action[name] for name in TCP_FEATURES], dtype=np.float64)
+    if values.shape != (9,) or not np.all(np.isfinite(values)):
+        raise ValueError("UR pose action must contain nine finite values")
+    return CartesianPose(values[:3], rot6d_to_rotation(values[3:]))
+
+
+def sigma_action_to_pose(action: dict[str, Any]) -> CartesianPose:
+    """Convert a Sigma xyz plus rotation-vector action to a Cartesian pose."""
+
+    missing = [name for name in SIGMA_POSE_FEATURES if name not in action]
+    if missing:
+        raise ValueError(f"Sigma pose action is missing required keys: {missing}")
+
+    values = np.asarray(
+        [action[name] for name in SIGMA_POSE_FEATURES],
+        dtype=np.float64,
+    )
     if values.shape != (6,) or not np.all(np.isfinite(values)):
-        raise ValueError("Pose action must contain six finite values")
+        raise ValueError("Sigma pose action must contain six finite values")
     return CartesianPose(values[:3], Rotation.from_rotvec(values[3:]))
 
 
 def pose_to_action(pose: CartesianPose) -> dict[str, float]:
-    """Convert a Cartesian pose to the action format expected by URRobot."""
+    """Convert a Cartesian pose to the xyz plus Rot6D format expected by URRobot."""
 
-    values = np.concatenate((pose.position, pose.orientation.as_rotvec()))
+    values = np.concatenate((pose.position, rotation_to_rot6d(pose.orientation)))
     return {
         name: float(value) for name, value in zip(TCP_FEATURES, values, strict=True)
     }
@@ -195,7 +207,7 @@ def capture_sigma_reference(
     positions: list[np.ndarray] = []
     rotation_vectors: list[np.ndarray] = []
     for sample_index in range(sample_count):
-        pose = action_to_pose(teleop.get_action())
+        pose = sigma_action_to_pose(teleop.get_action())
         positions.append(pose.position)
         rotation_vectors.append(pose.orientation.as_rotvec())
         if sample_index + 1 < sample_count:
@@ -213,39 +225,20 @@ def compute_relative_target(
     *,
     position_scale: float,
     base_mapping: Rotation,
-    max_relative_translation_m: float | None,
-    max_relative_rotation_rad: float | None,
 ) -> CartesianPose:
     """Map Sigma motion relative to its reference onto the UR reference pose."""
 
     translation_delta = position_scale * base_mapping.apply(
         sigma_current.position - sigma_reference.position
     )
-    translation_delta = _limit_vector_norm(
-        translation_delta,
-        max_relative_translation_m,
-    )
 
     sigma_rotation_delta = sigma_current.orientation * sigma_reference.orientation.inv()
     ur_rotation_delta = base_mapping * sigma_rotation_delta * base_mapping.inv()    # 共轭变换
-    rotation_delta_vector = _limit_vector_norm(
-        ur_rotation_delta.as_rotvec(),
-        max_relative_rotation_rad,
-    )
-    limited_ur_rotation_delta = Rotation.from_rotvec(rotation_delta_vector)
 
     return CartesianPose(
         position=ur_reference.position + translation_delta,
-        orientation=limited_ur_rotation_delta * ur_reference.orientation,
+        orientation=ur_rotation_delta * ur_reference.orientation,
     )
-
-
-def _limit_vector_norm(vector: np.ndarray, maximum: float | None) -> np.ndarray:
-    vector = np.asarray(vector, dtype=np.float64)
-    magnitude = float(np.linalg.norm(vector))
-    if maximum is None or magnitude <= maximum or magnitude == 0.0:
-        return vector
-    return vector * (maximum / magnitude)
 
 
 def main() -> None:
@@ -304,16 +297,17 @@ def main() -> None:
         last_display_time = 0.0
 
         while args.duration_s is None or time.perf_counter() - start_time < args.duration_s:
+            current_observation = None
+            if not args.dry_run:
+                current_observation = robot.get_observation()
             sigma_action = teleop.get_action()
-            sigma_current = action_to_pose(sigma_action)
+            sigma_current = sigma_action_to_pose(sigma_action)
             target = compute_relative_target(
                 sigma_reference,
                 sigma_current,
                 ur_reference,
                 position_scale=args.position_scale,
                 base_mapping=base_mapping,
-                max_relative_translation_m=args.max_relative_translation_m,
-                max_relative_rotation_rad=args.max_relative_rotation_rad,
             )
             target_action = pose_to_action(target)
             target_action[GRIPPER_FEATURE] = sigma_gripper_angle_to_ur_position(
@@ -325,7 +319,8 @@ def main() -> None:
             if args.dry_run:
                 sent_action = target_action
             else:
-                sent_action = robot.send_action(target_action)
+                assert current_observation is not None
+                sent_action = robot.send_action(target_action, current_observation)
 
             now = time.perf_counter()
             if now - last_display_time >= 0.2:

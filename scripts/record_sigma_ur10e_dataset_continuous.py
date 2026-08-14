@@ -6,7 +6,7 @@ session. Dataset recording and Sigma-to-UR coupling are independent states:
 
 * c couples Sigma to UR after capturing fresh relative-pose references.
 * d decouples Sigma from UR without disconnecting either device.
-* s starts an episode while teleoperation is coupled.
+* s selects a candidate task and starts an episode while teleoperation is coupled.
 * n saves the current episode and leaves teleoperation coupled for reset.
 * r discards the current episode and leaves teleoperation coupled for reset.
 * q saves a non-empty active episode and shuts down the session.
@@ -25,10 +25,11 @@ import queue
 import sys
 import threading
 import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum, auto
 from pathlib import Path
-from typing import Callable
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -47,35 +48,142 @@ from lerobot.utils.feature_utils import build_dataset_frame
 from lerobot.utils.keyboard_input import create_key_listener
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import init_logging, log_say
-
 from lerobot_camera_orbbec import OrbbecCameraConfig
 from lerobot_robot_ur import URRobotConfig
 from lerobot_teleoperator_sigma import Sigma, SigmaConfig
 
+from utils.const import DATA_PATH
+
 try:
-    from scripts.record_sigma_ur10e_dataset import (
-        DEFAULT_FREQUENCY_WARNING_RATIO,
+    from scripts.record_sigma_ur10e_common import (
         CameraAugmentedURRobot,
         FrequencyMonitor,
         RecordSample,
         SigmaRelativeURActionStep,
         build_dataset_features,
         capture_episode_references,
-        parse_args,
         validate_frequency_ratio,
     )
 except ModuleNotFoundError:
-    from record_sigma_ur10e_dataset import (  # type: ignore[no-redef]
-        DEFAULT_FREQUENCY_WARNING_RATIO,
+    from record_sigma_ur10e_common import (  # type: ignore[no-redef]
         CameraAugmentedURRobot,
         FrequencyMonitor,
         RecordSample,
         SigmaRelativeURActionStep,
         build_dataset_features,
         capture_episode_references,
-        parse_args,
         validate_frequency_ratio,
     )
+
+
+DEFAULT_ROBOT_IP = "192.168.253.102"
+DEFAULT_GEMINI_305_SERIAL = "CV2L360000C7"
+DEFAULT_GEMINI_336_SERIAL = "CP9JA530008V"
+DEFAULT_CONTROL_FPS = 60
+DEFAULT_DATASET_FPS = 20
+DEFAULT_FREQUENCY_WARNING_RATIO = 0.95
+DEFAULT_NUM_EPISODES = 28
+DEFAULT_EPISODE_TIME_S = 90.0
+DEFAULT_REFERENCE_SAMPLES = 20
+DEFAULT_POSITION_SCALE = 4.0
+DEFAULT_BASE_ROTATION_RAD = (0.0, 0.0, math.pi)
+DEFAULT_SIGMA_GRIPPER_CLOSED_RAD = 0.0
+DEFAULT_SIGMA_GRIPPER_OPEN_RAD = 0.5315
+DEFAULT_CANDIDATE_TASKS = (
+    "Pick up the blue can and place it upright on the red tape marker.",
+    "Pick up the purple can and place it upright on the red tape marker.",
+    "Pick up the yellow can and place it upright on the red tape marker.",
+    "Pick up the white box and place it upright on the red tape marker.",
+)
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse continuous-session recorder arguments."""
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    parser = argparse.ArgumentParser(description="Record a local LeRobot v3 dataset from UR10e and Sigma.7 with continuous teleoperation")
+
+    parser.add_argument("--task", help="Fallback task when --candidate-task is not provided")
+    parser.add_argument("--candidate-tasks", action="append", default=None, metavar="TASK", help="Candidate task shown before each episode. Repeat this option to build the candidate task set")
+
+    parser.add_argument("--repo-id", default=f"local/ur10e_sigma_{timestamp}")
+    parser.add_argument("--root", type=Path, default=DATA_PATH / f"pick_{timestamp}")
+    parser.add_argument("--num-episodes", type=int, default=DEFAULT_NUM_EPISODES)
+    parser.add_argument("--episode-time-s", type=float, default=DEFAULT_EPISODE_TIME_S)
+    parser.add_argument("--control-fps", type=int, default=DEFAULT_CONTROL_FPS)
+    parser.add_argument("--dataset-fps", type=int, default=DEFAULT_DATASET_FPS)
+    parser.add_argument("--frequency-warning-ratio", type=float, default=DEFAULT_FREQUENCY_WARNING_RATIO, help="Warn when an actual frequency is below this fraction of its target")
+    parser.add_argument("--image-writer-threads-per-camera", type=int, default=4)
+
+    parser.add_argument("--robot-ip", default=DEFAULT_ROBOT_IP)
+    parser.add_argument("--max-command-translation-m", type=float, default=0.1)
+    parser.add_argument("--max-command-rotation-rad", type=float, default=0.2)
+
+    parser.add_argument("--gemini-305-serial", default=DEFAULT_GEMINI_305_SERIAL)
+    parser.add_argument("--gemini-336-serial", default=DEFAULT_GEMINI_336_SERIAL)
+    parser.add_argument("--gemini-305-resolution", type=int, nargs=2, metavar=("WIDTH", "HEIGHT"), default=(640, 480))
+    parser.add_argument("--gemini-336-resolution", type=int, nargs=2, metavar=("WIDTH", "HEIGHT"), default=(320, 240))
+    parser.add_argument("--camera-warmup-s", type=float, default=1.0)
+
+    parser.add_argument("--sdk-path", type=Path, default=Path("/opt/forcedimension/sdk"))
+    sigma_selector = parser.add_mutually_exclusive_group()
+    sigma_selector.add_argument("--sigma-device-index", type=int, default=None)
+    sigma_selector.add_argument("--sigma-serial-number", type=int, default=None)
+    parser.add_argument("--gravity-compensation", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--reference-samples", type=int, default=DEFAULT_REFERENCE_SAMPLES)
+    parser.add_argument("--position-scale", type=float, default=DEFAULT_POSITION_SCALE)
+    parser.add_argument("--base-rotation-offset-rad", type=float, nargs=3, metavar=("RX", "RY", "RZ"), default=DEFAULT_BASE_ROTATION_RAD)
+    parser.add_argument("--sigma-gripper-closed-angle-rad", type=float, default=DEFAULT_SIGMA_GRIPPER_CLOSED_RAD)
+    parser.add_argument("--sigma-gripper-open-angle-rad", type=float, default=DEFAULT_SIGMA_GRIPPER_OPEN_RAD)
+
+    args = parser.parse_args(argv)
+    if args.task is not None:
+        args.task = args.task.strip()
+        if not args.task:
+            parser.error("--task must not be empty")
+    if args.candidate_tasks is not None:
+        args.candidate_tasks = [task.strip() for task in args.candidate_tasks]
+        if any(not task for task in args.candidate_tasks):
+            parser.error("--candidate-tasks must not be empty")
+    elif args.task is not None:
+        args.candidate_tasks = [args.task]
+    else:
+        args.candidate_tasks = list(DEFAULT_CANDIDATE_TASKS)
+    for name in (
+        "num_episodes",
+        "control_fps",
+        "dataset_fps",
+        "image_writer_threads_per_camera",
+        "reference_samples",
+    ):
+        if getattr(args, name) <= 0:
+            parser.error(f"--{name.replace('_', '-')} must be positive")
+    if args.control_fps % args.dataset_fps != 0:
+        parser.error("--control-fps must be an integer multiple of --dataset-fps")
+    if (
+        not math.isfinite(args.frequency_warning_ratio)
+        or not 0 < args.frequency_warning_ratio <= 1
+    ):
+        parser.error("--frequency-warning-ratio must be finite and in (0, 1]")
+    for name in (
+        "episode_time_s",
+        "max_command_translation_m",
+        "max_command_rotation_rad",
+        "position_scale",
+    ):
+        value = getattr(args, name)
+        if not math.isfinite(value) or value <= 0:
+            parser.error(f"--{name.replace('_', '-')} must be finite and positive")
+    for camera_name in ("gemini_305", "gemini_336"):
+        if any(value <= 0 for value in getattr(args, f"{camera_name}_resolution")):
+            parser.error(f"{camera_name.replace('_', '-')} dimensions must be positive")
+    if not math.isfinite(args.camera_warmup_s) or args.camera_warmup_s < 0:
+        parser.error("--camera-warmup-s must be finite and non-negative")
+    if args.sigma_gripper_closed_angle_rad < 0:
+        parser.error("--sigma-gripper-closed-angle-rad must be non-negative")
+    if args.sigma_gripper_open_angle_rad <= args.sigma_gripper_closed_angle_rad:
+        parser.error("Sigma gripper open angle must be greater than the closed angle")
+    return args
 
 
 class TeleoperationState(Enum):
@@ -85,6 +193,7 @@ class TeleoperationState(Enum):
 
 class EpisodeState(Enum):
     IDLE = auto()
+    SELECTING_TASK = auto()
     RECORDING = auto()
     SAVING = auto()
     FINISHED = auto()
@@ -97,6 +206,19 @@ class SessionCommand(Enum):
     FINISH_EPISODE = auto()
     RERECORD_EPISODE = auto()
     QUIT = auto()
+
+
+KEY_COMMANDS = {
+    "c": SessionCommand.ENABLE_TELEOP,
+    "d": SessionCommand.DISABLE_TELEOP,
+    "s": SessionCommand.START_EPISODE,
+    "n": SessionCommand.FINISH_EPISODE,
+    "right": SessionCommand.FINISH_EPISODE,
+    "r": SessionCommand.RERECORD_EPISODE,
+    "left": SessionCommand.RERECORD_EPISODE,
+    "q": SessionCommand.QUIT,
+    "esc": SessionCommand.QUIT,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,7 +234,56 @@ class EpisodeWriteResult:
     frame_count: int
 
 
+@dataclass(frozen=True, slots=True)
+class EpisodeRecordSample:
+    sample: RecordSample
+    task: str
+
+
 _WRITER_SENTINEL = object()
+
+
+def _flush_pending_stdin() -> None:
+    """Discard hotkeys left in the terminal input buffer before a prompt."""
+
+    if not sys.stdin.isatty():
+        return
+    try:
+        import termios
+    except ImportError:
+        return
+    with contextlib.suppress(OSError, termios.error):
+        termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+
+
+def select_candidate_task(
+    candidate_tasks: Sequence[str],
+    *,
+    input_fn: Callable[[str], str] = input,
+    flush_input_fn: Callable[[], None] = _flush_pending_stdin,
+) -> str:
+    """Prompt the operator to select one task by its one-based index."""
+
+    if not candidate_tasks:
+        raise ValueError("Candidate task set must not be empty")
+
+    print("Candidate tasks:")
+    for index, candidate_task in enumerate(candidate_tasks, start=1):
+        print(f"  {index}. {candidate_task}")
+
+    flush_input_fn()
+    while True:
+        response = input_fn(
+            f"Select task for the next episode [1-{len(candidate_tasks)}]: "
+        ).strip()
+        try:
+            selected_index = int(response)
+        except ValueError:
+            print("Invalid task index. Enter a number from the list.")
+            continue
+        if 1 <= selected_index <= len(candidate_tasks):
+            return candidate_tasks[selected_index - 1]
+        print("Task index is out of range.")
 
 
 def handle_session_key(
@@ -121,19 +292,9 @@ def handle_session_key(
 ) -> None:
     """Translate one keyboard event into a session command."""
 
-    key = name.lower()
-    if key == "c":
-        command_queue.put(SessionCommand.ENABLE_TELEOP)
-    elif key == "d":
-        command_queue.put(SessionCommand.DISABLE_TELEOP)
-    elif key == "s":
-        command_queue.put(SessionCommand.START_EPISODE)
-    elif key in {"n", "right"}:
-        command_queue.put(SessionCommand.FINISH_EPISODE)
-    elif key in {"r", "left"}:
-        command_queue.put(SessionCommand.RERECORD_EPISODE)
-    elif key in {"q", "esc"}:
-        command_queue.put(SessionCommand.QUIT)
+    command = KEY_COMMANDS.get(name.lower())
+    if command is not None:
+        command_queue.put(command)
 
 
 def _get_pending_commands(
@@ -159,13 +320,15 @@ def run_continuous_session(
     control_fps: int,
     dataset_fps: int,
     episode_time_s: float,
-    task: str,
+    task: str | None = None,
+    candidate_tasks: Sequence[str] | None = None,
     reference_samples: int,
     teleop_action_processor: RobotProcessorPipeline,
     robot_action_processor: RobotProcessorPipeline,
     robot_observation_processor: RobotProcessorPipeline,
     frequency_warning_ratio: float = DEFAULT_FREQUENCY_WARNING_RATIO,
     capture_references: Callable[..., None] = capture_episode_references,
+    task_selector: Callable[[Sequence[str]], str] = select_candidate_task,
 ) -> int:
     """Run teleoperation continuously and gate dataset writes by episode state."""
 
@@ -184,13 +347,21 @@ def run_continuous_session(
             "Dataset FPS does not match requested dataset FPS: "
             f"{dataset.fps} != {dataset_fps}"
         )
+    resolved_candidate_tasks = tuple(
+        candidate_tasks or (() if task is None else (task,))
+    )
+    if not resolved_candidate_tasks or any(
+        not candidate_task.strip() for candidate_task in resolved_candidate_tasks
+    ):
+        raise ValueError("Candidate task set must contain non-empty tasks")
 
     writer_queue_capacity = max(2 * dataset_fps + 2, 4)
-    writer_queue: queue.Queue[RecordSample | EpisodeBoundary | object] = queue.Queue(
-        maxsize=writer_queue_capacity
+    writer_queue: queue.Queue[EpisodeRecordSample | EpisodeBoundary | object] = (
+        queue.Queue(maxsize=writer_queue_capacity)
     )
     writer_results: queue.SimpleQueue[EpisodeWriteResult] = queue.SimpleQueue()
     writer_errors: list[BaseException] = []
+    task_selection_results: queue.SimpleQueue[str | BaseException] = queue.SimpleQueue()
 
     def recording_worker() -> None:
         frequency_monitor: FrequencyMonitor | None = None
@@ -218,7 +389,7 @@ def run_continuous_session(
                     frequency_monitor = None
                     continue
 
-                if not isinstance(item, RecordSample):
+                if not isinstance(item, EpisodeRecordSample):
                     raise TypeError(f"Unexpected recording queue item: {type(item)}")
                 if frequency_monitor is None:
                     frequency_monitor = FrequencyMonitor(
@@ -227,7 +398,9 @@ def run_continuous_session(
                         warning_ratio=frequency_warning_ratio,
                     )
 
-                processed_observation = robot_observation_processor(item.observation)
+                processed_observation = robot_observation_processor(
+                    item.sample.observation
+                )
                 dataset_observation = build_dataset_frame(
                     dataset.features,
                     processed_observation,
@@ -235,11 +408,11 @@ def run_continuous_session(
                 )
                 dataset_action = build_dataset_frame(
                     dataset.features,
-                    item.sent_action,
+                    item.sample.sent_action,
                     prefix=ACTION,
                 )
                 dataset.add_frame(
-                    {**dataset_observation, **dataset_action, "task": task}
+                    {**dataset_observation, **dataset_action, "task": item.task}
                 )
                 frequency_monitor.tick()
         except BaseException as exc:
@@ -258,6 +431,7 @@ def run_continuous_session(
     episode_frame_count = 0
     episode_control_step = 0
     episode_start_t: float | None = None
+    episode_task: str | None = None
     stop_requested = False
     control_frequency_monitor: FrequencyMonitor | None = None
     control_interval_s = 1.0 / control_fps
@@ -274,6 +448,67 @@ def run_continuous_session(
             control_fps=control_fps,
         )
         next_control_t = time.perf_counter()
+
+    def start_task_selection() -> None:
+        nonlocal episode_state
+
+        def select_task_worker() -> None:
+            try:
+                task_selection_results.put(task_selector(resolved_candidate_tasks))
+            except BaseException as exc:
+                task_selection_results.put(exc)
+
+        episode_state = EpisodeState.SELECTING_TASK
+        task_selection_thread = threading.Thread(
+            target=select_task_worker,
+            name="ur10e-episode-task-selection",
+            daemon=True,
+        )
+        task_selection_thread.start()
+
+    def process_task_selection() -> None:
+        nonlocal episode_state, episode_task
+        nonlocal episode_frame_count, episode_control_step, episode_start_t
+        nonlocal control_frequency_monitor
+
+        if episode_state is not EpisodeState.SELECTING_TASK:
+            return
+        try:
+            result = task_selection_results.get_nowait()
+        except queue.Empty:
+            return
+        if isinstance(result, BaseException):
+            raise RuntimeError("Task selection failed") from result
+        if result not in resolved_candidate_tasks:
+            raise ValueError("Task selector returned a task outside the candidate set")
+        if teleop_state is TeleoperationState.DISABLED:
+            episode_state = EpisodeState.IDLE
+            logging.warning(
+                "Task was selected after teleoperation was disabled. "
+                "Press s to select again"
+            )
+            return
+
+        episode_task = result
+        selected_task_index = resolved_candidate_tasks.index(episode_task) + 1
+        log_say(f"Selected task {selected_task_index}: {episode_task}")
+        capture_current_references(
+            "Hold Sigma still while episode references are captured"
+        )
+        control_frequency_monitor = FrequencyMonitor(
+            name="Teleoperation control",
+            target_hz=control_fps,
+            warning_ratio=frequency_warning_ratio,
+        )
+        episode_frame_count = 0
+        episode_control_step = 0
+        episode_start_t = time.perf_counter()
+        episode_state = EpisodeState.RECORDING
+        log_say(
+            f"Recording episode {recorded_episodes + 1} of "
+            f"{num_episodes}. Press n to save, r to discard, "
+            "d to decouple and discard, or q to quit"
+        )
 
     def enqueue_boundary(*, save: bool) -> None:
         nonlocal episode_state
@@ -305,9 +540,7 @@ def run_continuous_session(
                 log_say("Empty episode was not saved")
             else:
                 discarded_episodes += 1
-                log_say(
-                    f"Episode discarded with {result.frame_count} buffered frames"
-                )
+                log_say(f"Episode discarded with {result.frame_count} buffered frames")
 
             if recorded_episodes >= num_episodes:
                 episode_state = EpisodeState.FINISHED
@@ -333,16 +566,16 @@ def run_continuous_session(
                     break
         writer_thread.join()
 
-    log_say(
-        "Teleoperation is disabled. Press c to capture references and enable it"
-    )
+    log_say("Teleoperation is disabled. Press c to capture references and enable it")
 
     session_error: BaseException | None = None
     try:
         while not stop_requested:
             process_writer_results()
             if writer_errors:
-                raise RuntimeError("Dataset recording thread failed") from writer_errors[0]
+                raise RuntimeError(
+                    "Dataset recording thread failed"
+                ) from writer_errors[0]
 
             for command in _get_pending_commands(command_queue):
                 if command is SessionCommand.QUIT:
@@ -361,7 +594,8 @@ def run_continuous_session(
                         logging.info("Teleoperation is already enabled")
                     else:
                         capture_current_references(
-                            "Hold Sigma still while teleoperation references are captured"
+                            "Hold Sigma still while teleoperation references are "
+                            "captured"
                         )
                         teleop_state = TeleoperationState.ENABLED
                         control_frequency_monitor = FrequencyMonitor(
@@ -379,6 +613,10 @@ def run_continuous_session(
                             "Discarding the active episode"
                         )
                         enqueue_boundary(save=False)
+                    elif episode_state is EpisodeState.SELECTING_TASK:
+                        logging.info(
+                            "Teleoperation disabled while task selection is pending"
+                        )
                     if teleop_state is TeleoperationState.ENABLED:
                         teleop_state = TeleoperationState.DISABLED
                         mapper.clear_reference()
@@ -397,9 +635,9 @@ def run_continuous_session(
                             "All requested episodes have already been saved"
                         )
                     elif episode_state is EpisodeState.SAVING:
-                        logging.warning(
-                            "The previous episode is still being saved"
-                        )
+                        logging.warning("The previous episode is still being saved")
+                    elif episode_state is EpisodeState.SELECTING_TASK:
+                        logging.info("Task selection is already in progress")
                     elif episode_state is EpisodeState.RECORDING:
                         logging.info("An episode is already being recorded")
                     elif teleop_state is TeleoperationState.DISABLED:
@@ -407,23 +645,7 @@ def run_continuous_session(
                             "Teleoperation is disabled. Press c before starting"
                         )
                     else:
-                        capture_current_references(
-                            "Hold Sigma still while episode references are captured"
-                        )
-                        control_frequency_monitor = FrequencyMonitor(
-                            name="Teleoperation control",
-                            target_hz=control_fps,
-                            warning_ratio=frequency_warning_ratio,
-                        )
-                        episode_frame_count = 0
-                        episode_control_step = 0
-                        episode_start_t = time.perf_counter()
-                        episode_state = EpisodeState.RECORDING
-                        log_say(
-                            f"Recording episode {recorded_episodes + 1} of "
-                            f"{num_episodes}. Press n to save, r to discard, "
-                            "d to decouple and discard, or q to quit"
-                        )
+                        start_task_selection()
                     continue
 
                 if command is SessionCommand.FINISH_EPISODE:
@@ -443,6 +665,8 @@ def run_continuous_session(
 
             if stop_requested:
                 break
+
+            process_task_selection()
 
             if (
                 episode_state is EpisodeState.RECORDING
@@ -476,13 +700,18 @@ def run_continuous_session(
                     control_frequency_monitor.tick()
 
                 if should_record:
+                    if episode_task is None:
+                        raise RuntimeError("Recording episode has no selected task")
                     if writer_queue.qsize() >= writer_queue_capacity - 2:
                         raise RuntimeError(
                             "Recording queue is full because dataset writing "
                             "cannot keep up"
                         )
                     writer_queue.put_nowait(
-                        RecordSample(recorded_observation, sent_action)
+                        EpisodeRecordSample(
+                            sample=RecordSample(recorded_observation, sent_action),
+                            task=episode_task,
+                        )
                     )
                     episode_frame_count += 1
 
@@ -527,7 +756,7 @@ def run(args: argparse.Namespace) -> LeRobotDataset:
             serial_number_or_name=args.gemini_305_serial,
             width=gemini_305_width,
             height=gemini_305_height,
-            fps=args.dataset_fps,
+            fps=60,
             warmup_s=args.camera_warmup_s,
             exposure=155,
             gain=35,
@@ -537,9 +766,9 @@ def run(args: argparse.Namespace) -> LeRobotDataset:
             serial_number_or_name=args.gemini_336_serial,
             width=gemini_336_width,
             height=gemini_336_height,
-            fps=args.dataset_fps,
+            fps=60,
             warmup_s=args.camera_warmup_s,
-            exposure=160,
+            exposure=150,
             gain=19,
             white_balance=4200,
         ),
@@ -549,8 +778,9 @@ def run(args: argparse.Namespace) -> LeRobotDataset:
             id="ur10e-continuous-dataset-recorder",
             robot_ip=args.robot_ip,
             use_gripper=True,
-            gripper_position_poll_frequency_hz=args.control_fps,
+            gripper_control_frequency_hz=args.control_fps,
             check_pose_safety=False,
+            tcp_pose=(0.0, 0.0, 0.174, 0.0, 0.0, 0.0),
             max_tcp_translation_delta_m=args.max_command_translation_m,
             max_tcp_rotation_delta_rad=args.max_command_rotation_rad,
         ),
@@ -602,8 +832,7 @@ def run(args: argparse.Namespace) -> LeRobotDataset:
         features=features,
         use_videos=False,
         image_writer_processes=0,
-        image_writer_threads=args.image_writer_threads_per_camera
-        * len(robot.cameras),
+        image_writer_threads=args.image_writer_threads_per_camera * len(robot.cameras),
         rgb_encoder=RGBEncoderConfig(vcodec="h264"),
     )
 
@@ -611,8 +840,7 @@ def run(args: argparse.Namespace) -> LeRobotDataset:
     listener = create_key_listener(
         lambda key: handle_session_key(key, command_queue),
         controls_help=(
-            "c=connect teleop, d=disconnect teleop, s=start, "
-            "n=save, r=rerecord, q=quit"
+            "c=connect teleop, d=disconnect teleop, s=start, n=save, r=rerecord, q=quit"
         ),
     )
     if listener is None:
@@ -642,7 +870,7 @@ def run(args: argparse.Namespace) -> LeRobotDataset:
             control_fps=args.control_fps,
             dataset_fps=args.dataset_fps,
             episode_time_s=args.episode_time_s,
-            task=args.task,
+            candidate_tasks=args.candidate_tasks,
             reference_samples=args.reference_samples,
             teleop_action_processor=teleop_action_processor,
             robot_action_processor=robot_action_processor,

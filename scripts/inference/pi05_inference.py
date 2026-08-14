@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
-"""Run an OpenPI policy as a closed-loop controller for a UR robot."""
+"""Run an OpenPI policy server as a closed-loop controller for a UR robot.
+
+Requires a reachable policy server, UR robot, and two Gemini cameras. The script
+commands the robot and can record a LeRobot dataset episode.
+Set --action-sampling-factor above 1 to interpolate and send actions faster than
+policy inference. Example: python scripts/inference/pi05_inference.py --control-fps 20 --action-sampling-factor 3
+"""
 
 from __future__ import annotations
 
 import argparse
 import contextlib
-import math
-import sys
-import time
 import logging
+import math
+import time
 from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
@@ -17,15 +22,21 @@ import numpy as np
 from lerobot.configs.video import RGBEncoderConfig
 from lerobot.datasets import LeRobotDataset
 from lerobot.utils.robot_utils import precise_sleep
-from openpi_client import image_tools
-from openpi_client import websocket_client_policy
-
 from lerobot_camera_orbbec import OrbbecCamera, OrbbecCameraConfig
 from lerobot_robot_ur import URRobot, URRobotConfig
 from lerobot_robot_ur.ur import GRIPPER_FEATURE, TCP_FEATURES
-from scripts.openpi.ur_action_adapter import UR_ACTION_DIM, create_absolute_action_broker
-from utils.const import DATA_PATH
+from openpi_client import image_tools, websocket_client_policy
 
+from scripts.openpi.ur_action_adapter import (
+    UR_ACTION_DIM,
+    create_absolute_action_broker,
+    create_rtc_action_broker,
+)
+from utils.const import DATA_PATH
+from utils.ur_action_utils import interpolate_actions
+
+# state 慢于 action 两个step，理论上只慢一个step，原因需要查找
+# 采集帧率 20Hz 不够, 感觉可能至少得 30Hz (或者降低运动速度)
 
 POLICY_HOST = "127.0.0.1"
 POLICY_PORT = 8000
@@ -33,7 +44,7 @@ POLICY_PORT = 8000
 DEFAULT_ROBOT_IP = "192.168.253.102"
 DEFAULT_GEMINI_305_SERIAL = "CV2L360000C7"
 DEFAULT_GEMINI_336_SERIAL = "CP9JA530008V"
-DEFAULT_PROMPT = "pick up the blue can and place it on the red tape"
+DEFAULT_PROMPT = "Pick up the yellow can and place it upright on the red tape marker."
 DEFAULT_CONTROL_FPS = 20
 DEFAULT_EXECUTION_HORIZON = 10
 
@@ -48,7 +59,6 @@ CAMERA_CONFIG = {
         "size": None,
     },
 }
-TCP_POSE = (0.0, 0.0, 0.174, 0.0, 0.0, 0.0)
 
 root_logger = logging.getLogger()
 root_logger.setLevel(logging.INFO)          # 设置根记录器的等级为 INFO
@@ -65,54 +75,35 @@ if not root_logger.handlers:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    parser = argparse.ArgumentParser(
-        description="Control a UR robot with actions from an OpenPI policy server",
-    )
+    parser = argparse.ArgumentParser(description="Control a UR robot with actions from an OpenPI policy server")
+
     parser.add_argument("--policy-host", default=POLICY_HOST)
     parser.add_argument("--policy-port", type=int, default=POLICY_PORT)
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--execution-horizon", type=int, default=DEFAULT_EXECUTION_HORIZON)
     parser.add_argument("--warmup-inferences", type=int, default=2)
     parser.add_argument("--control-fps", type=float, default=DEFAULT_CONTROL_FPS)
-    parser.add_argument(
-        "--start-immediately",
-        action="store_true",
-        help="Skip the interactive safety confirmation before sending actions",
-    )
-    parser.add_argument(
-        "--record",
-        action=argparse.BooleanOptionalAction, default=True,
-        help="Record one LeRobot Dataset episode during policy execution",
-    )
+    parser.add_argument("--action-sampling-factor", type=int, default=10, help="Number of evenly spaced robot actions sent per policy control period")
+    parser.add_argument("--use-rtc", default=False, action=argparse.BooleanOptionalAction, help="Use RTC action broker instead of absolute action broker")
+    parser.add_argument("--prefix-len", type=int, default=2)
+    parser.add_argument("--decay-end", type=int, default=4)
+    parser.add_argument("--use-vjp", default=False, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--start-immediately", action="store_true", help="Skip the interactive safety confirmation before sending actions")
+
+    parser.add_argument("--record", action=argparse.BooleanOptionalAction, default=True, help="Record one LeRobot Dataset episode during policy execution")
     parser.add_argument("--repo-id", default=f"pi05_pick_{timestamp}")
-    parser.add_argument(
-        "--dataset-dir",
-        type=Path,
-        default=DATA_PATH / "deploy",
-    )
+    parser.add_argument("--dataset-dir", type=Path, default=DATA_PATH / "deploy")
     parser.add_argument("--image-writer-threads-per-camera", type=int, default=4)
 
     parser.add_argument("--robot-ip", default=DEFAULT_ROBOT_IP)
-    parser.add_argument("--tcp-pose", type=float, nargs=6, default=TCP_POSE, metavar=("X", "Y", "Z", "RX", "RY", "RZ"))
+    parser.add_argument("--tcp-pose", type=float, nargs=6, default=(0.0, 0.0, 0.174, 0.0, 0.0, 0.0), metavar=("X", "Y", "Z", "RX", "RY", "RZ"))
     parser.add_argument("--max-command-translation-m", type=float, default=0.1)
     parser.add_argument("--max-command-rotation-rad", type=float, default=0.2)
 
     parser.add_argument("--gemini-305-serial", default=DEFAULT_GEMINI_305_SERIAL)
     parser.add_argument("--gemini-336-serial", default=DEFAULT_GEMINI_336_SERIAL)
-    parser.add_argument(
-        "--gemini-305-resolution",
-        type=int,
-        nargs=2,
-        metavar=("WIDTH", "HEIGHT"),
-        default=(640, 480),
-    )
-    parser.add_argument(
-        "--gemini-336-resolution",
-        type=int,
-        nargs=2,
-        metavar=("WIDTH", "HEIGHT"),
-        default=(320, 240),
-    )
+    parser.add_argument("--gemini-305-resolution", type=int, nargs=2, metavar=("WIDTH", "HEIGHT"), default=(640, 480))
+    parser.add_argument("--gemini-336-resolution", type=int, nargs=2, metavar=("WIDTH", "HEIGHT"), default=(320, 240))
     parser.add_argument("--camera-fps", type=int, default=60)
     parser.add_argument("--camera-warmup-s", type=float, default=1.0)
     parser.add_argument("--camera-max-age-ms", type=int, default=500)
@@ -128,8 +119,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--execution-horizon must be positive")
     if args.warmup_inferences < 0:
         parser.error("--warmup-inferences must be non-negative")
+    if args.prefix_len <= 0:
+        parser.error("--prefix-len must be positive")
+    if args.decay_end < args.prefix_len:
+        parser.error("--decay-end must be greater than or equal to --prefix-len")
     if not math.isfinite(args.control_fps) or args.control_fps <= 0:
         parser.error("--control-fps must be finite and positive")
+    if args.action_sampling_factor <= 0:
+        parser.error("--action-sampling-factor must be positive")
     if args.record and not float(args.control_fps).is_integer():
         parser.error("--control-fps must be an integer when --record is enabled")
     if not args.repo_id.strip():
@@ -282,6 +279,11 @@ def create_recording_dataset(
     }
     features = {
         "action": vector_feature,
+        "debug.capture_time": {
+            "dtype": "float32",
+            "shape": (1,),
+            "names": ["seconds_since_previous_frame"],
+        },
         "observation.state": vector_feature.copy(),
         "observation.images.left_wrist_0_rgb": image_feature,
         "observation.images.base_0_rgb": image_feature.copy(),
@@ -303,6 +305,7 @@ def add_recording_frame(
     dataset: LeRobotDataset,
     policy_observation: dict[str, object],
     sent_action: dict[str, object],
+    capture_time_s: float,
 ) -> None:
     """Record the pre-action observation and the action actually sent to the UR."""
 
@@ -321,6 +324,7 @@ def add_recording_frame(
                 dtype=np.uint8,
             ).copy(),
             "action": robot_observation_to_state(sent_action),
+            "debug.capture_time": np.asarray([capture_time_s], dtype=np.float32),
             "task": str(policy_observation["prompt"]),
         }
     )
@@ -356,13 +360,17 @@ def run_control_loop(
     policy: object,
     prompt: str,
     control_fps: float,
+    action_sampling_factor: int,
     camera_max_age_ms: int,
     dataset: LeRobotDataset | None = None,
 ) -> None:
-    """Continuously observe, infer one broker action, and send it to the UR."""
+    """Observe and infer at control FPS, sending interpolated actions faster."""
 
     control_interval_s = 1.0 / control_fps
+    action_interval_s = control_interval_s / action_sampling_factor
     next_control_t = time.perf_counter()
+    previous_capture_t: float | None = None
+    previous_policy_action: np.ndarray | None = None
     step = 0
 
     while True:
@@ -373,6 +381,11 @@ def run_control_loop(
             prompt=prompt,
             camera_max_age_ms=camera_max_age_ms,
         )
+        capture_t = time.perf_counter()
+        capture_time_s = (
+            0.0 if previous_capture_t is None else capture_t - previous_capture_t
+        )
+        previous_capture_t = capture_t
 
         infer_start = time.perf_counter()
         result = policy.infer(policy_observation)
@@ -380,10 +393,27 @@ def run_control_loop(
         if "actions" not in result:
             raise RuntimeError("Policy result does not contain actions")
 
-        robot_action = policy_action_to_robot_action(result["actions"])
-        sent_action = robot.send_action(robot_action, robot_observation)
+        target_action = np.asarray(result["actions"], dtype=np.float32)
+        start_action = (
+            robot_observation_to_state(robot_observation)
+            if previous_policy_action is None
+            else previous_policy_action
+        )
+        sampled_actions = interpolate_actions(start_action, target_action, action_sampling_factor)
+        previous_policy_action = target_action.copy()
+        sent_action = robot_observation
+        for sample_index, sampled_action in enumerate(sampled_actions, start=1):
+            send_t = next_control_t + sample_index * action_interval_s
+            precise_sleep(max(send_t - time.perf_counter(), 0.0))
+            robot_action = policy_action_to_robot_action(sampled_action)
+            sent_action = robot.send_action(robot_action, sent_action, False)
         if dataset is not None:
-            add_recording_frame(dataset, policy_observation, sent_action)
+            add_recording_frame(
+                dataset,
+                policy_observation,
+                sent_action,
+                capture_time_s,
+            )
 
         step += 1
         # if infer_elapsed_s > control_interval_s:
@@ -439,11 +469,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             id="openpi-ur-controller",
             robot_ip=args.robot_ip,
             use_gripper=True,
-            gripper_position_poll_frequency_hz=args.control_fps,
-            check_pose_safety=True,
+            gripper_control_frequency_hz=args.control_fps * args.action_sampling_factor,
             max_tcp_translation_delta_m=args.max_command_translation_m,
             max_tcp_rotation_delta_rad=args.max_command_rotation_rad,
             tcp_pose=args.tcp_pose,
+            rtde_check_pose_safety=False,
         )
     )
 
@@ -494,11 +524,23 @@ def main(argv: Sequence[str] | None = None) -> None:
                 raise RuntimeError("Policy warmup returned NaN or Inf actions")
             print(f"Warmup {index + 1}: {elapsed_s * 1000:.1f} ms")
 
-        policy = create_absolute_action_broker(
-            client,
-            metadata,
-            execution_horizon=args.execution_horizon,
-        )
+        if args.use_rtc:
+            print("Using RTC action broker")
+            policy = create_rtc_action_broker(
+                client,
+                metadata,
+                replan_interval=args.execution_horizon,     # execution chunk
+                prefix_len=args.prefix_len,
+                decay_end=args.decay_end,
+                use_vjp=args.use_vjp,
+            )
+        else:
+            print("Using absolute action broker")
+            policy = create_absolute_action_broker(
+                client,
+                metadata,
+                execution_horizon=args.execution_horizon,
+            )
 
         if not args.start_immediately:
             confirmation = input(
@@ -517,6 +559,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 policy=policy,
                 prompt=args.prompt,
                 control_fps=args.control_fps,
+                action_sampling_factor=args.action_sampling_factor,
                 camera_max_age_ms=args.camera_max_age_ms,
                 dataset=dataset,
             )

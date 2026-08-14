@@ -8,3 +8,9 @@ build/
 dist/
 
 Log/
+
+data/
+
+.vscode/
+
+.env
