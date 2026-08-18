@@ -50,7 +50,7 @@ from tqdm import tqdm
 
 from utils.const import DATA_PATH
 
-ROOT_PATH = DATA_PATH / "pick_20260725_174915_20fps"
+ROOT_PATH = DATA_PATH / "pick_v3_merge"
 
 LOGGER = logging.getLogger(__name__)
 
@@ -1134,68 +1134,35 @@ def build_rgb_encoder_configs(
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Crop, resize, and encode every episode in a local LeRobot 0.6 image dataset"
-        ),
-    )
+    parser = argparse.ArgumentParser(description="Crop, resize, and encode every episode in a local LeRobot 0.6 image dataset")
+
     parser.add_argument("--source-root", type=Path, default=ROOT_PATH, help="Source dataset directory")
-    parser.add_argument(
-        "--output-root",
-        type=Path,
-        help="Output dataset directory. Defaults to SOURCE_ROOT_crop_vid.",
-    )
+    parser.add_argument("--output-root", type=Path, help="Output dataset directory. Defaults to SOURCE_ROOT_crop_vid.")
+
     parser.add_argument("--repo-id", help="Source repo id. Defaults to the source directory name.")
-    parser.add_argument(
-        "--output-repo-id",
-        help="Output repo id. Defaults to REPO_ID_crop_vid.",
-    )
+    parser.add_argument("--output-repo-id", help="Output repo id. Defaults to REPO_ID_crop_vid.")
+
     parser.add_argument("--num-workers", type=positive_integer, default=12)
     parser.add_argument("--max-episodes-per-batch", type=positive_integer)
     parser.add_argument("--max-frames-per-batch", type=positive_integer)
+
     parser.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Validate inputs and show the conversion configuration without writing output.",
-    )
+    parser.add_argument("--dry-run", action="store_true", help="Validate inputs and show the conversion configuration without writing output.")
 
     rgb_group = parser.add_argument_group("RGB encoder")
-    rgb_group.add_argument(
-        "--vcodec",
-        choices=sorted(NVENC_CODECS),
-        default="hevc_nvenc",
-    )
+    rgb_group.add_argument("--vcodec", choices=sorted(NVENC_CODECS), default="hevc_nvenc")
     rgb_group.add_argument("--pix-fmt", default="yuv420p")
     rgb_group.add_argument("--gop", type=positive_integer, default=1)
-    rgb_group.add_argument(
-        "--qp",
-        "--crf",
-        dest="qp",
-        type=float,
-        default=21,
-        help="NVENC constant QP. Lower values preserve more detail.",
-    )
-    rgb_group.add_argument(
-        "--preset",
-        type=optional_preset,
-        default="p6",
-        help="NVENC preset name such as p4, p5, or p6. Auto selects p5.",
-    )
+    rgb_group.add_argument("--qp", "--crf", dest="qp", type=float, default=21, help="NVENC constant QP. Lower values preserve more detail.")
+    rgb_group.add_argument("--preset", type=optional_preset, default="p6", help="NVENC preset name such as p4, p5, or p6. Auto selects p5.")
     rgb_group.add_argument("--fast-decode", type=int, choices=range(0, 3), default=0)
-    rgb_group.add_argument(
-        "--ffmpeg-path",
-        default="ffmpeg",
-        help="System FFmpeg executable used by NVENC codecs.",
-    )
+
+    rgb_group.add_argument("--ffmpeg-path", default="ffmpeg", help="System FFmpeg executable used by NVENC codecs.")
     rgb_group.add_argument("--ffprobe-path", default="ffprobe")
+
     rgb_group.add_argument("--nvenc-gpu", type=int, default=0)
     rgb_group.add_argument("--scale-flags", default="lanczos")
-    rgb_group.add_argument(
-        "--nvenc-tune",
-        choices=("hq", "ll", "ull", "lossless"),
-        default="hq",
-    )
+    rgb_group.add_argument("--nvenc-tune", choices=("hq", "ll", "ull", "lossless"), default="hq")
 
     depth_group = parser.add_argument_group("Depth encoder")
     depth_group.add_argument("--depth-vcodec", default="hevc")
@@ -1207,11 +1174,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     depth_group.add_argument("--depth-min", type=float, default=0.01)
     depth_group.add_argument("--depth-max", type=float, default=10.0)
     depth_group.add_argument("--depth-shift", type=float, default=3.5)
-    depth_group.add_argument(
-        "--depth-use-log",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
+    depth_group.add_argument("--depth-use-log", action=argparse.BooleanOptionalAction, default=True)
+
     return parser.parse_args(argv)
 
 

@@ -10,7 +10,8 @@ dist/
 Log/
 
 data/
+outputs/
 
 .vscode/
-
+.ruff_cache/
 .env

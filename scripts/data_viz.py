@@ -1,22 +1,29 @@
 # 直接调用 lerobot 内置的 visualize_dataset 函数进行可视化
 
+import gc
+import logging
+import time
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import rerun as rr
+import rerun.blueprint as rrb
+import torch
+import tqdm
+from lerobot.configs import DEPTH_MILLIMETER_UNIT
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.scripts.lerobot_dataset_viz import visualize_dataset
+from lerobot.scripts.lerobot_dataset_viz import to_hwc_float32_numpy, to_hwc_uint8_numpy
+from lerobot.utils.constants import ACTION, DONE, OBS_STATE, REWARD, SUCCESS
 
 from utils.const import *
 from utils.dataset_utils import validate_local_dataset_root_and_repo_id
 
 
 # ====== 在这里直接指定你的配置 ======
-REPO_ID:str = "pick_20260725_174915_vid"             # local不需要, 但需要有值
-EPISODE_INDICES = list(range(0, 5, 1))
+REPO_ID:str = "pick_20260817_220807"             # local不需要, 但需要有值
+EPISODE_INDICES = list(range(0, 10, 1))
+# ROOT = DATA_PATH / "deploy" / REPO_ID
 ROOT = DATA_PATH / REPO_ID
-# ROOT = OUTPUT_DIR / "inference" / "lapar" / "act_20260310_192829"
 OUTPUT_DIR = OUTPUT_PATH / "viz_output"      # 仅当 save=True 时使用
 SAVE = False                                # 设为 True 会保存 .rrd 文件而不弹窗
 MODE = "local"                              # 可选: "local" 或 "distant"
@@ -24,133 +31,160 @@ BATCH_SIZE = 32
 NUM_WORKERS = 12
 TOLERANCE_S = 1e-4
 DISPLAY_COMPRESSED_IMAGES = True
-RERUN_TIMELINE = "frame_index"              # timestamp or frame_index
-
-# 将 observation.environment_state 写入 dataframe, 需要手动从时间轴中选择
-ENABLE_ENVIRONMENT_STATE_DATAFRAME = False
-ENVIRONMENT_STATE_FEATURE = "observation.environment_state"
-ENVIRONMENT_STATE_ENTITY_PATH = "environment_state"
-
-# 额外写入 gripper 相关 time series
-ENABLE_GRIPPER_SERIES = False
-GRIPPER_SERIES_FEATURE = "observation.state"
-GRIPPER_SERIES_DIM_NAMES = ["gripper_tool3.pos"]
-GRIPPER_SERIES_ENTITY_PREFIX = "gripper"
-
-# 额外写入 pose_tool3.pos.x/y/z 到同一张 time series 图
-ENABLE_POSE_TOOL3_POS_SERIES = False
-POSE_TOOL3_POS_FEATURE = "observation.state"
-POSE_TOOL3_POS_DIM_NAMES = [
-    "pose_tool3.pos.x",
-    "pose_tool3.pos.y",
-    "pose_tool3.pos.z",
-]
-POSE_TOOL3_POS_ENTITY_PREFIX = "pose_tool3_pos"
+DISPLAY_DEBUG_FEATURES = True
 
 
-def set_sample_time(sample: dict, first_index: int) -> None:
-    sample_index = int(sample["index"])
-    rr.reset_time()
-    if RERUN_TIMELINE == "timestamp":
-        rr.set_time(RERUN_TIMELINE, timestamp=float(sample["timestamp"]))
-    else:
-        rr.set_time(RERUN_TIMELINE, sequence=sample_index - first_index)
+def get_feature_names(dataset: LeRobotDataset, key: str) -> list[str]:
+    feature = dataset.features[key]
+    dimension = feature["shape"][-1]
+    names = feature.get("names")
+    if isinstance(names, list) and len(names) == dimension:
+        return [str(name) for name in names]
+    return [f"dim_{index}" for index in range(dimension)]
 
 
-def get_feature_dim_names(dataset: LeRobotDataset, feature: str) -> list[str]:
-    feature_info = dataset.meta.info["features"].get(feature)
-    if feature_info is None:
-        raise KeyError(f"Feature {feature!r} not found in dataset metadata.")
+def log_vector(root: str, values, names: list[str] | None = None) -> None:
+    if hasattr(values, "detach"):
+        values = values.detach().cpu().numpy()
+    values = np.asarray(values).reshape(-1)
+    if names is None or len(names) != len(values):
+        names = [f"dim_{index}" for index in range(len(values))]
 
-    names = list(feature_info.get("names") or [])
-    if names:
-        return names
-    return [f"dim_{i}" for i in range(int(feature_info["shape"][0]))]
-
-
-def resolve_feature_dim(dataset: LeRobotDataset, feature: str, dim_name: str) -> tuple[int, str]:
-    names = get_feature_dim_names(dataset, feature)
-    if dim_name not in names:
-        raise ValueError(f"Dimension {dim_name!r} not found in {feature}. Available names: {names}")
-    return names.index(dim_name), dim_name
+    for name, value in zip(names, values, strict=True):
+        rr.log(f"{root}/{name}", rr.Scalars(float(value)))
 
 
-def resolve_feature_dims(dataset: LeRobotDataset, feature: str, dim_names: list[str]) -> list[tuple[int, str]]:
-    return [resolve_feature_dim(dataset, feature, dim_name) for dim_name in dim_names]
+def get_debug_feature_keys(dataset: LeRobotDataset) -> list[str]:
+    return [key for key in dataset.features if key.startswith("debug.")]
 
 
-def feature_value_vector(value) -> np.ndarray:
-    if hasattr(value, "detach"):
-        value = value.detach().cpu().numpy()
-    return np.asarray(value, dtype=np.float32).reshape(-1)
+def debug_feature_entity_path(key: str) -> str:
+    return key.replace(".", "/")
 
 
-def log_scalar_series_to_rerun(
+def build_blueprint_from_dataset(
     dataset: LeRobotDataset,
-    feature: str,
-    dim_names: list[str],
-    entity_prefix: str,
-) -> None:
-    dim_specs = resolve_feature_dims(dataset, feature, dim_names)
-    first_index = None
-
-    for sample in dataset.hf_dataset:
-        sample_index = int(sample["index"])
-        if first_index is None:
-            first_index = sample_index
-        set_sample_time(sample, first_index)
-
-        values = feature_value_vector(sample[feature])
-        for dim_index, dim_label in dim_specs:
-            rr.log(f"{entity_prefix}/{dim_label}", rr.Scalars(float(values[dim_index])))
+    display_debug_features: bool = False,
+) -> rrb.Blueprint:
+    views = [rrb.Spatial2DView(origin=key, name=key) for key in dataset.meta.camera_keys]
+    for root, key in ((ACTION, ACTION), ("state", OBS_STATE)):
+        if key in dataset.features:
+            views.append(rrb.TimeSeriesView(origin=root, name=root))
+    for key in (DONE, REWARD, SUCCESS):
+        if key in dataset.features:
+            views.append(rrb.TimeSeriesView(origin=key, name=key))
+    if display_debug_features:
+        for key in get_debug_feature_keys(dataset):
+            entity_path = debug_feature_entity_path(key)
+            views.append(rrb.TimeSeriesView(origin=entity_path, name=key))
+    return rrb.Blueprint(rrb.Grid(*views))
 
 
-def build_feature_dataframe(dataset: LeRobotDataset, feature: str) -> pd.DataFrame:
-    dim_names = get_feature_dim_names(dataset, feature)
-    rows = []
-    first_index = None
+def visualize_dataset(
+    dataset: LeRobotDataset,
+    episode_index: int,
+    batch_size: int = 32,
+    num_workers: int = 0,
+    mode: str = "local",
+    web_port: int | None = None,
+    grpc_port: int = 9876,
+    save: bool = False,
+    output_dir: Path | None = None,
+    display_compressed_images: bool = False,
+    display_debug_features: bool = False,
+) -> Path | None:
+    if save and output_dir is None:
+        raise ValueError("output_dir is required when save=True.")
+    if mode not in ("local", "distant"):
+        raise ValueError(f"Unsupported mode: {mode}")
 
-    for sample in dataset.hf_dataset:
-        sample_index = int(sample["index"])
-        if first_index is None:
-            first_index = sample_index
-
-        row = {
-            "rerun_index": sample_index - first_index,
-            "index": sample_index,
-            "episode_index": int(sample["episode_index"]),
-            "frame_index": int(sample["frame_index"]),
-            "timestamp": float(sample["timestamp"]),
-        }
-        values = feature_value_vector(sample[feature])
-        for dim_index, dim_name in enumerate(dim_names):
-            row[dim_name] = float(values[dim_index])
-        rows.append(row)
-
-    return pd.DataFrame(rows)
-
-
-def log_dataframe_to_rerun(df: pd.DataFrame, entity_path: str) -> None:
-    if df.empty:
-        return
-
-    if RERUN_TIMELINE == "timestamp":
-        indexes = [rr.TimeColumn(RERUN_TIMELINE, timestamp=df["timestamp"].tolist())]
-    else:
-        indexes = [rr.TimeColumn(RERUN_TIMELINE, sequence=df["rerun_index"].astype(int).tolist())]
-
-    component_df = df.drop(columns=["rerun_index"])
-    rr.send_columns(
-        entity_path,
-        indexes=indexes,
-        columns=rr.AnyValues.columns(**component_df.to_dict(orient="list")),
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        num_workers=num_workers,
+        batch_size=batch_size,
     )
+    rr.init(
+        f"{dataset.repo_id}/episode_{episode_index}",
+        spawn=mode == "local" and not save,
+        default_blueprint=build_blueprint_from_dataset(dataset, display_debug_features),
+    )
+    gc.collect()
 
+    if mode == "distant":
+        server_uri = rr.serve_grpc(grpc_port=grpc_port)
+        logging.info(f"Connect to a Rerun Server: rerun rerun+http://IP:{grpc_port}/proxy")
+        rr.serve_web_viewer(
+            open_browser=False,
+            web_port=web_port or 9090,
+            connect_to=server_uri,
+        )
 
-def log_environment_state_dataframe_to_rerun(dataset: LeRobotDataset) -> pd.DataFrame:
-    df = build_feature_dataframe(dataset, ENVIRONMENT_STATE_FEATURE)
-    log_dataframe_to_rerun(df, ENVIRONMENT_STATE_ENTITY_PATH)
-    return df
+    action_names = get_feature_names(dataset, ACTION) if ACTION in dataset.features else None
+    state_names = get_feature_names(dataset, OBS_STATE) if OBS_STATE in dataset.features else None
+    debug_feature_keys = get_debug_feature_keys(dataset) if display_debug_features else []
+    debug_feature_names = {key: get_feature_names(dataset, key) for key in debug_feature_keys}
+    depth_meter = 1000.0 if dataset.depth_output_unit == DEPTH_MILLIMETER_UNIT else 1.0
+    depth_ranges = {}
+    for key in dataset.meta.depth_keys:
+        stats = (dataset.meta.stats or {}).get(key)
+        if stats:
+            lower = stats["q01"] if "q01" in stats else stats["min"]
+            upper = stats["q99"] if "q99" in stats else stats["max"]
+            depth_ranges[key] = (float(np.asarray(lower).item()), float(np.asarray(upper).item()))
+
+    first_index = None
+    for batch in tqdm.tqdm(dataloader, total=len(dataloader)):
+        if first_index is None:
+            first_index = batch["index"][0].item()
+
+        for index in range(len(batch["index"])):
+            rr.set_time("frame_index", sequence=batch["index"][index].item() - first_index)
+            rr.set_time("timestamp", timestamp=batch["timestamp"][index].item())
+
+            for key in dataset.meta.camera_keys:
+                if key in dataset.meta.depth_keys:
+                    depth = to_hwc_float32_numpy(batch[key][index])
+                    rr.log(
+                        key,
+                        rr.DepthImage(
+                            depth,
+                            meter=depth_meter,
+                            colormap=rr.components.Colormap.Viridis,
+                            depth_range=depth_ranges.get(key),
+                        ),
+                    )
+                else:
+                    image = rr.Image(to_hwc_uint8_numpy(batch[key][index]))
+                    rr.log(key, image.compress() if display_compressed_images else image)
+
+            if ACTION in batch:
+                log_vector(ACTION, batch[ACTION][index], action_names)
+            if OBS_STATE in batch:
+                log_vector("state", batch[OBS_STATE][index], state_names)
+            for key in (DONE, REWARD, SUCCESS):
+                if key in batch:
+                    rr.log(key, rr.Scalars(batch[key][index].item()))
+            for key in debug_feature_keys:
+                if key in batch:
+                    log_vector(
+                        debug_feature_entity_path(key),
+                        batch[key][index],
+                        debug_feature_names[key],
+                    )
+
+    if mode == "local" and save:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / f"{dataset.repo_id.replace('/', '_')}_episode_{episode_index}.rrd"
+        rr.save(output_path)
+        return output_path
+
+    if mode == "distant":
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print("Ctrl-C received. Exiting.")
+    return None
 
 
 def load_episode_dataset(episode_index: int) -> LeRobotDataset:
@@ -163,13 +197,6 @@ def load_episode_dataset(episode_index: int) -> LeRobotDataset:
 
 
 if __name__ == "__main__":
-    if MODE == "distant" and (
-        ENABLE_GRIPPER_SERIES
-        or ENABLE_ENVIRONMENT_STATE_DATAFRAME
-        or ENABLE_POSE_TOOL3_POS_SERIES
-    ):
-        raise ValueError("MODE='distant' blocks inside visualize_dataset, so extra rerun logging cannot run after it.")
-
     validate_local_dataset_root_and_repo_id(ROOT, REPO_ID)
 
     for episode_index in EPISODE_INDICES:
@@ -178,7 +205,7 @@ if __name__ == "__main__":
         print(f"Episode {episode_index} loaded with {len(dataset)} samples.")
         print(f"Checking first sample: {dataset[0].keys()}")
 
-        rrd_path = visualize_dataset(
+        visualize_dataset(
             dataset=dataset,
             episode_index=episode_index,
             batch_size=BATCH_SIZE,
@@ -187,41 +214,8 @@ if __name__ == "__main__":
             save=SAVE,
             output_dir=OUTPUT_DIR if SAVE else None,
             display_compressed_images=DISPLAY_COMPRESSED_IMAGES,
+            display_debug_features=DISPLAY_DEBUG_FEATURES,
         )
-
-        if ENABLE_GRIPPER_SERIES:
-            log_scalar_series_to_rerun(
-                dataset=dataset,
-                feature=GRIPPER_SERIES_FEATURE,
-                dim_names=GRIPPER_SERIES_DIM_NAMES,
-                entity_prefix=GRIPPER_SERIES_ENTITY_PREFIX,
-            )
-            print(f"Logged gripper series for episode {episode_index}: {GRIPPER_SERIES_DIM_NAMES}")
-
-        if ENABLE_POSE_TOOL3_POS_SERIES:
-            log_scalar_series_to_rerun(
-                dataset=dataset,
-                feature=POSE_TOOL3_POS_FEATURE,
-                dim_names=POSE_TOOL3_POS_DIM_NAMES,
-                entity_prefix=POSE_TOOL3_POS_ENTITY_PREFIX,
-            )
-            print(f"Logged pose_tool3.pos series for episode {episode_index}: {POSE_TOOL3_POS_FEATURE}")
-
-        if ENABLE_ENVIRONMENT_STATE_DATAFRAME:
-            environment_state_df = log_environment_state_dataframe_to_rerun(dataset)
-            print(
-                f"Logged environment state dataframe for episode {episode_index}: "
-                f"{ENVIRONMENT_STATE_FEATURE}, rows={len(environment_state_df)}"
-            )
-
-        if (
-            ENABLE_GRIPPER_SERIES
-            or ENABLE_ENVIRONMENT_STATE_DATAFRAME
-            or ENABLE_POSE_TOOL3_POS_SERIES
-        ):
-            if SAVE and rrd_path is not None:
-                rr.save(rrd_path)
-                print(f"Updated saved rerun file with extra series: {rrd_path}")
 
 
 # rerun --connect rerun+http://127.0.0.1:9876/proxy     # lerobot ssh调用数据显示

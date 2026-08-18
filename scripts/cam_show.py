@@ -11,6 +11,10 @@ HEIGHT = 480
 FPS = 60
 FRAME_TIMEOUT_MS = 1000
 
+# Crop points use (x, y) pixels. The end point is exclusive.
+CROP_START_PIXEL = (96, 28)
+CROP_END_PIXEL = (96+448, 28+448)  # Crop to 448x448 pixels, centered vertically
+
 # gemini 305
 # # Edit these values and restart the script to compare the captured image.
 # # Gemini 305 and 336 commonly support exposure 1-1990/1665, gain 16-248,
@@ -30,7 +34,7 @@ FRAME_TIMEOUT_MS = 1000
 # Gemini 305 and 336 commonly support exposure 1-1990/1665, gain 16-248,
 # white balance 2800-6500, and backlight compensation 0-6.
 AUTO_EXPOSURE = False
-EXPOSURE = 160
+EXPOSURE = 150
 GAIN = 19
 AUTO_WHITE_BALANCE = False
 WHITE_BALANCE = 4200
@@ -93,6 +97,24 @@ def color_frame_to_bgr(frame):
     raise RuntimeError(f"Unsupported color frame format: {frame_format}")
 
 
+def crop_image(image):
+    """Crop an image using the configured start and exclusive end pixels."""
+    start_x, start_y = CROP_START_PIXEL if CROP_START_PIXEL is not None else (0, 0)
+    end_x, end_y = CROP_END_PIXEL if CROP_END_PIXEL is not None else (image.shape[1], image.shape[0])
+    image_height, image_width = image.shape[:2]
+
+    if not (
+        0 <= start_x < end_x <= image_width
+        and 0 <= start_y < end_y <= image_height
+    ):
+        raise ValueError(
+            f"Invalid crop from {CROP_START_PIXEL} to {CROP_END_PIXEL} for "
+            f"an image with size {image_width}x{image_height}"
+        )
+
+    return image[start_y:end_y, start_x:end_x]
+
+
 def main():
     context = ob.Context()
     device_list = context.query_devices()
@@ -140,7 +162,8 @@ def main():
                 continue
 
             image = color_frame_to_bgr(color_frame)
-            cv2.imshow("Orbbec RGB Camera", image)
+            cropped_image = crop_image(image)
+            cv2.imshow("Orbbec RGB Camera", cropped_image)
 
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
