@@ -1,6 +1,12 @@
 #!/usr/bin/env python
 """Record UR10e demonstrations with session-wide Sigma teleoperation.
 
+Camera acquisition, teleoperation control, and dataset sampling use independent
+frequencies. UR RTDE and Robotiq use their driver defaults. Each dataset frame
+pairs one control observation with the action successfully sent from that same
+control step. A fixed-rate sampling thread adds the latest camera frames, and a
+separate writer thread commits queued samples to the dataset.
+
 The robot, cameras, and Sigma remain physically connected for the whole
 session. Dataset recording and Sigma-to-UR coupling are independent states:
 
@@ -13,6 +19,9 @@ session. Dataset recording and Sigma-to-UR coupling are independent states:
 
 After the requested number of episodes has been saved, teleoperation remains
 available so the operator can reset the robot and object before pressing q.
+
+Example:
+    python scripts/record_sigma_ur10e_dataset_continuous.py --camera-fps 60 --control-fps 60 --dataset-fps 20
 """
 
 from __future__ import annotations
@@ -62,7 +71,6 @@ try:
         SigmaRelativeURActionStep,
         build_dataset_features,
         capture_episode_references,
-        validate_frequency_ratio,
     )
 except ModuleNotFoundError:
     from record_sigma_ur10e_common import (  # type: ignore[no-redef]
@@ -72,20 +80,20 @@ except ModuleNotFoundError:
         SigmaRelativeURActionStep,
         build_dataset_features,
         capture_episode_references,
-        validate_frequency_ratio,
     )
 
 
 DEFAULT_ROBOT_IP = "192.168.253.102"
 DEFAULT_GEMINI_305_SERIAL = "CV2L360000C7"
 DEFAULT_GEMINI_336_SERIAL = "CP9JA530008V"
-DEFAULT_CONTROL_FPS = 60
+DEFAULT_CAMERA_FPS = 60
+DEFAULT_CONTROL_FPS = 500
 DEFAULT_DATASET_FPS = 20
 DEFAULT_FREQUENCY_WARNING_RATIO = 0.95
-DEFAULT_NUM_EPISODES = 28
+DEFAULT_NUM_EPISODES = 10
 DEFAULT_EPISODE_TIME_S = 90.0
-DEFAULT_REFERENCE_SAMPLES = 20
-DEFAULT_POSITION_SCALE = 4.0
+DEFAULT_REFERENCE_SAMPLES = 20      # number of Sigma-UR teleoperation 0 reference point.
+DEFAULT_POSITION_SCALE = 3.5
 DEFAULT_BASE_ROTATION_RAD = (0.0, 0.0, math.pi)
 DEFAULT_SIGMA_GRIPPER_CLOSED_RAD = 0.0
 DEFAULT_SIGMA_GRIPPER_OPEN_RAD = 0.5315
@@ -110,8 +118,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--root", type=Path, default=DATA_PATH / f"pick_{timestamp}")
     parser.add_argument("--num-episodes", type=int, default=DEFAULT_NUM_EPISODES)
     parser.add_argument("--episode-time-s", type=float, default=DEFAULT_EPISODE_TIME_S)
-    parser.add_argument("--control-fps", type=int, default=DEFAULT_CONTROL_FPS)
-    parser.add_argument("--dataset-fps", type=int, default=DEFAULT_DATASET_FPS)
+    parser.add_argument("--camera-fps", type=int, default=DEFAULT_CAMERA_FPS, help="Camera acquisition frequency")
+    parser.add_argument("--control-fps", type=int, default=DEFAULT_CONTROL_FPS, help="Sigma teleoperation processing and send_action frequency")
+    parser.add_argument("--dataset-fps", type=int, default=DEFAULT_DATASET_FPS, help="Fixed-frequency dataset sampling rate")
     parser.add_argument("--frequency-warning-ratio", type=float, default=DEFAULT_FREQUENCY_WARNING_RATIO, help="Warn when an actual frequency is below this fraction of its target")
     parser.add_argument("--image-writer-threads-per-camera", type=int, default=4)
 
@@ -151,6 +160,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.candidate_tasks = list(DEFAULT_CANDIDATE_TASKS)
     for name in (
         "num_episodes",
+        "camera_fps",
         "control_fps",
         "dataset_fps",
         "image_writer_threads_per_camera",
@@ -158,8 +168,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
-    if args.control_fps % args.dataset_fps != 0:
-        parser.error("--control-fps must be an integer multiple of --dataset-fps")
+    if args.dataset_fps > args.control_fps:
+        parser.error("--dataset-fps must not exceed --control-fps")
     if (
         not math.isfinite(args.frequency_warning_ratio)
         or not 0 < args.frequency_warning_ratio <= 1
@@ -240,7 +250,29 @@ class EpisodeRecordSample:
     task: str
 
 
+@dataclass(frozen=True, slots=True)
+class LatestControlSample:
+    sample: RecordSample
+    captured_at: float
+    sequence: int
+    episode_generation: int
+
+
+@dataclass(frozen=True, slots=True)
+class SamplingEpisodeStart:
+    task: str
+    generation: int
+    started_at: float
+
+
+@dataclass(frozen=True, slots=True)
+class SamplingEpisodeBoundary:
+    save: bool
+    generation: int
+
+
 _WRITER_SENTINEL = object()
+_SAMPLER_SENTINEL = object()
 
 
 def _flush_pending_stdin() -> None:
@@ -332,9 +364,14 @@ def run_continuous_session(
 ) -> int:
     """Run teleoperation continuously and gate dataset writes by episode state."""
 
-    record_stride = validate_frequency_ratio(control_fps, dataset_fps)
     if num_episodes <= 0:
         raise ValueError("Number of episodes must be positive")
+    if control_fps <= 0:
+        raise ValueError("Control FPS must be positive")
+    if dataset_fps <= 0:
+        raise ValueError("Dataset FPS must be positive")
+    if dataset_fps > control_fps:
+        raise ValueError("Dataset FPS must not exceed control FPS")
     if not math.isfinite(episode_time_s) or episode_time_s <= 0:
         raise ValueError("Episode time must be finite and positive")
     if (
@@ -362,9 +399,15 @@ def run_continuous_session(
     writer_results: queue.SimpleQueue[EpisodeWriteResult] = queue.SimpleQueue()
     writer_errors: list[BaseException] = []
     task_selection_results: queue.SimpleQueue[str | BaseException] = queue.SimpleQueue()
+    sampling_commands: queue.Queue[
+        SamplingEpisodeStart | SamplingEpisodeBoundary | object
+    ] = queue.Queue()
+    sampling_errors: list[BaseException] = []
+    latest_control_lock = threading.Lock()
+    latest_control_sample: LatestControlSample | None = None
+    dataset_interval_s = 1.0 / dataset_fps
 
     def recording_worker() -> None:
-        frequency_monitor: FrequencyMonitor | None = None
         try:
             while True:
                 item = writer_queue.get()
@@ -386,17 +429,10 @@ def run_continuous_session(
                             frame_count=item.frame_count,
                         )
                     )
-                    frequency_monitor = None
                     continue
 
                 if not isinstance(item, EpisodeRecordSample):
                     raise TypeError(f"Unexpected recording queue item: {type(item)}")
-                if frequency_monitor is None:
-                    frequency_monitor = FrequencyMonitor(
-                        name="Dataset recording",
-                        target_hz=dataset_fps,
-                        warning_ratio=frequency_warning_ratio,
-                    )
 
                 processed_observation = robot_observation_processor(
                     item.sample.observation
@@ -414,24 +450,134 @@ def run_continuous_session(
                 dataset.add_frame(
                     {**dataset_observation, **dataset_action, "task": item.task}
                 )
-                frequency_monitor.tick()
         except BaseException as exc:
             writer_errors.append(exc)
+
+    def sampling_worker() -> None:
+        active_episode: SamplingEpisodeStart | None = None
+        episode_frame_count = 0
+        next_dataset_t: float | None = None
+        frequency_monitor: FrequencyMonitor | None = None
+
+        try:
+            while True:
+                if next_dataset_t is None:
+                    timeout = None
+                else:
+                    timeout = max(next_dataset_t - time.perf_counter(), 0.0)
+
+                try:
+                    command = sampling_commands.get(timeout=timeout)
+                except queue.Empty:
+                    command = None
+
+                if command is _SAMPLER_SENTINEL:
+                    return
+
+                if isinstance(command, SamplingEpisodeStart):
+                    if active_episode is not None:
+                        raise RuntimeError(
+                            "Cannot start dataset sampling while an episode is active"
+                        )
+                    active_episode = command
+                    episode_frame_count = 0
+                    next_dataset_t = command.started_at
+                    frequency_monitor = FrequencyMonitor(
+                        name="Dataset sampling",
+                        target_hz=dataset_fps,
+                        warning_ratio=frequency_warning_ratio,
+                    )
+                elif isinstance(command, SamplingEpisodeBoundary):
+                    if (
+                        active_episode is None
+                        or command.generation != active_episode.generation
+                    ):
+                        raise RuntimeError(
+                            "Dataset sampling boundary does not match the active episode"
+                        )
+                    try:
+                        writer_queue.put_nowait(
+                            EpisodeBoundary(
+                                save=command.save,
+                                frame_count=episode_frame_count,
+                            )
+                        )
+                    except queue.Full as exc:
+                        raise RuntimeError(
+                            "Recording queue is full while closing the current episode"
+                        ) from exc
+                    active_episode = None
+                    episode_frame_count = 0
+                    next_dataset_t = None
+                    frequency_monitor = None
+                    continue
+                elif command is not None:
+                    raise TypeError(
+                        f"Unexpected sampling command: {type(command)}"
+                    )
+
+                if active_episode is None or next_dataset_t is None:
+                    continue
+
+                sample_t = time.perf_counter()
+                if sample_t < next_dataset_t:
+                    continue
+
+                with latest_control_lock:
+                    control_sample = latest_control_sample
+                if (
+                    control_sample is not None
+                    and control_sample.episode_generation
+                    == active_episode.generation
+                ):
+                    recorded_observation = robot.add_camera_observations(
+                        control_sample.sample.observation
+                    )
+                    if writer_queue.qsize() >= writer_queue_capacity - 2:
+                        raise RuntimeError(
+                            "Recording queue is full because dataset writing "
+                            "cannot keep up"
+                        )
+                    writer_queue.put_nowait(
+                        EpisodeRecordSample(
+                            sample=RecordSample(
+                                recorded_observation,
+                                dict(control_sample.sample.sent_action),
+                            ),
+                            task=active_episode.task,
+                        )
+                    )
+                    episode_frame_count += 1
+                    if frequency_monitor is not None:
+                        frequency_monitor.tick()
+
+                elapsed_intervals = math.floor(
+                    (sample_t - next_dataset_t) / dataset_interval_s
+                ) + 1
+                next_dataset_t += elapsed_intervals * dataset_interval_s
+        except BaseException as exc:  # noqa: BLE001 - propagate worker failures.
+            sampling_errors.append(exc)
 
     writer_thread = threading.Thread(
         target=recording_worker,
         name="ur10e-continuous-dataset-recording",
     )
     writer_thread.start()
+    sampling_thread = threading.Thread(
+        target=sampling_worker,
+        name="ur10e-continuous-dataset-sampling",
+    )
+    sampling_thread.start()
 
     teleop_state = TeleoperationState.DISABLED
     episode_state = EpisodeState.IDLE
     recorded_episodes = 0
     discarded_episodes = 0
-    episode_frame_count = 0
-    episode_control_step = 0
     episode_start_t: float | None = None
     episode_task: str | None = None
+    episode_generation = 0
+    sampling_started_generation: int | None = None
+    control_sequence = 0
     stop_requested = False
     control_frequency_monitor: FrequencyMonitor | None = None
     control_interval_s = 1.0 / control_fps
@@ -468,8 +614,8 @@ def run_continuous_session(
 
     def process_task_selection() -> None:
         nonlocal episode_state, episode_task
-        nonlocal episode_frame_count, episode_control_step, episode_start_t
-        nonlocal control_frequency_monitor
+        nonlocal episode_start_t, episode_generation
+        nonlocal sampling_started_generation, control_frequency_monitor
 
         if episode_state is not EpisodeState.SELECTING_TASK:
             return
@@ -500,8 +646,8 @@ def run_continuous_session(
             target_hz=control_fps,
             warning_ratio=frequency_warning_ratio,
         )
-        episode_frame_count = 0
-        episode_control_step = 0
+        episode_generation += 1
+        sampling_started_generation = None
         episode_start_t = time.perf_counter()
         episode_state = EpisodeState.RECORDING
         log_say(
@@ -510,15 +656,30 @@ def run_continuous_session(
             "d to decouple and discard, or q to quit"
         )
 
+    def start_sampling_if_needed() -> None:
+        nonlocal sampling_started_generation
+        if sampling_started_generation == episode_generation:
+            return
+        if episode_task is None or episode_start_t is None:
+            raise RuntimeError("Recording episode is missing sampling metadata")
+        sampling_commands.put_nowait(
+            SamplingEpisodeStart(
+                task=episode_task,
+                generation=episode_generation,
+                started_at=episode_start_t,
+            )
+        )
+        sampling_started_generation = episode_generation
+
     def enqueue_boundary(*, save: bool) -> None:
         nonlocal episode_state
-        boundary = EpisodeBoundary(save=save, frame_count=episode_frame_count)
-        try:
-            writer_queue.put_nowait(boundary)
-        except queue.Full as exc:
-            raise RuntimeError(
-                "Recording queue is full while closing the current episode"
-            ) from exc
+        start_sampling_if_needed()
+        sampling_commands.put_nowait(
+            SamplingEpisodeBoundary(
+                save=save,
+                generation=episode_generation,
+            )
+        )
         episode_state = EpisodeState.SAVING
 
     def process_writer_results() -> None:
@@ -566,6 +727,10 @@ def run_continuous_session(
                     break
         writer_thread.join()
 
+    def stop_sampler() -> None:
+        sampling_commands.put(_SAMPLER_SENTINEL)
+        sampling_thread.join()
+
     log_say("Teleoperation is disabled. Press c to capture references and enable it")
 
     session_error: BaseException | None = None
@@ -576,6 +741,10 @@ def run_continuous_session(
                 raise RuntimeError(
                     "Dataset recording thread failed"
                 ) from writer_errors[0]
+            if sampling_errors:
+                raise RuntimeError(
+                    "Dataset sampling thread failed"
+                ) from sampling_errors[0]
 
             for command in _get_pending_commands(command_queue):
                 if command is SessionCommand.QUIT:
@@ -678,15 +847,6 @@ def run_continuous_session(
 
             if teleop_state is TeleoperationState.ENABLED:
                 control_observation = robot.get_control_observation()
-                should_record = (
-                    episode_state is EpisodeState.RECORDING
-                    and episode_control_step % record_stride == 0
-                )
-                if should_record:
-                    recorded_observation = robot.add_camera_observations(
-                        control_observation
-                    )
-
                 raw_sigma_action = teleop.get_action()
                 requested_action = teleop_action_processor(
                     (raw_sigma_action, control_observation)
@@ -694,29 +854,28 @@ def run_continuous_session(
                 robot_action = robot_action_processor(
                     (requested_action, control_observation)
                 )
-                sent_action = robot.send_action(robot_action, control_observation)
+                sent_action = robot.send_action(
+                    robot_action,
+                    control_observation,
+                    step_limit_check=True,
+                )
+                control_sequence += 1
+                with latest_control_lock:
+                    latest_control_sample = LatestControlSample(
+                        sample=RecordSample(
+                            dict(control_observation),
+                            dict(sent_action),
+                        ),
+                        captured_at=time.perf_counter(),
+                        sequence=control_sequence,
+                        episode_generation=episode_generation,
+                    )
 
                 if control_frequency_monitor is not None:
                     control_frequency_monitor.tick()
 
-                if should_record:
-                    if episode_task is None:
-                        raise RuntimeError("Recording episode has no selected task")
-                    if writer_queue.qsize() >= writer_queue_capacity - 2:
-                        raise RuntimeError(
-                            "Recording queue is full because dataset writing "
-                            "cannot keep up"
-                        )
-                    writer_queue.put_nowait(
-                        EpisodeRecordSample(
-                            sample=RecordSample(recorded_observation, sent_action),
-                            task=episode_task,
-                        )
-                    )
-                    episode_frame_count += 1
-
                 if episode_state is EpisodeState.RECORDING:
-                    episode_control_step += 1
+                    start_sampling_if_needed()
 
             next_control_t += control_interval_s
             precise_sleep(max(next_control_t - time.perf_counter(), 0.0))
@@ -728,9 +887,12 @@ def run_continuous_session(
             with contextlib.suppress(BaseException):
                 enqueue_boundary(save=False)
     finally:
+        stop_sampler()
         stop_writer()
         process_writer_results()
 
+    if sampling_errors:
+        raise RuntimeError("Dataset sampling thread failed") from sampling_errors[0]
     if writer_errors:
         raise RuntimeError("Dataset recording thread failed") from writer_errors[0]
     if session_error is not None:
@@ -747,8 +909,6 @@ def run_continuous_session(
 def run(args: argparse.Namespace) -> LeRobotDataset:
     """Create devices and dataset, then run the continuous session."""
 
-    validate_frequency_ratio(args.control_fps, args.dataset_fps)
-
     gemini_305_width, gemini_305_height = args.gemini_305_resolution
     gemini_336_width, gemini_336_height = args.gemini_336_resolution
     camera_configs: dict[str, CameraConfig] = {
@@ -756,21 +916,25 @@ def run(args: argparse.Namespace) -> LeRobotDataset:
             serial_number_or_name=args.gemini_305_serial,
             width=gemini_305_width,
             height=gemini_305_height,
-            fps=60,
+            fps=args.camera_fps,
             warmup_s=args.camera_warmup_s,
+            frame_rate_warning_ratio=args.frequency_warning_ratio,
             exposure=155,
             gain=35,
             white_balance=3700,
+            anti_flicker=True,
         ),
         "base_0_rgb": OrbbecCameraConfig(
             serial_number_or_name=args.gemini_336_serial,
             width=gemini_336_width,
             height=gemini_336_height,
-            fps=60,
+            fps=args.camera_fps,
             warmup_s=args.camera_warmup_s,
+            frame_rate_warning_ratio=args.frequency_warning_ratio,
             exposure=150,
             gain=19,
             white_balance=4200,
+            anti_flicker=True,
         ),
     }
     robot = CameraAugmentedURRobot(
@@ -778,8 +942,7 @@ def run(args: argparse.Namespace) -> LeRobotDataset:
             id="ur10e-continuous-dataset-recorder",
             robot_ip=args.robot_ip,
             use_gripper=True,
-            gripper_control_frequency_hz=args.control_fps,
-            check_pose_safety=False,
+            rtde_check_pose_safety=False,
             tcp_pose=(0.0, 0.0, 0.174, 0.0, 0.0, 0.0),
             max_tcp_translation_delta_m=args.max_command_translation_m,
             max_tcp_rotation_delta_rad=args.max_command_rotation_rad,
@@ -909,7 +1072,7 @@ def run(args: argparse.Namespace) -> LeRobotDataset:
 
 
 def main() -> None:
-    init_logging()
+    init_logging(console_level="INFO")
     run(parse_args())
 
 
