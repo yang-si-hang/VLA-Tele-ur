@@ -2,15 +2,16 @@
 
 The helpers enumerate cameras, select a device by serial number or name, match
 an exact RGB stream profile, validate and apply supported color properties, and
-convert SDK color frames into NumPy RGB arrays. ``OrbbecColorStream`` owns the
-SDK pipeline lifecycle so the LeRobot-facing adapter can remain independent of
-SDK object details.
+convert SDK color frames into detached NumPy RGB arrays with capture metadata.
+``OrbbecColorStream`` owns the SDK pipeline lifecycle so the LeRobot-facing
+adapter can remain independent of SDK object details.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any
 
 import cv2
 import numpy as np
@@ -30,6 +31,17 @@ class ColorProfile:
     height: int
     fps: int
     format_name: str
+
+
+@dataclass(frozen=True)
+class ColorFrame:
+    """One detached RGB frame with its SDK capture metadata."""
+
+    image: NDArray[np.uint8]
+    frame_index: int
+    # global_timestamp_us: int
+    device_timestamp_us: int
+    system_timestamp_us: int
 
 
 _COLOR_SETTING_PROPERTIES = {
@@ -107,10 +119,29 @@ def set_device_color_settings(
 
     # Some ISP controls can affect related properties. Verify the complete
     # configuration once more after every requested value has been written.
+    verify_device_color_settings(device, settings)
+
+    return applied
+
+
+def verify_device_color_settings(
+    device: Any,
+    settings: Mapping[str, bool | int],
+) -> dict[str, bool | int]:
+    """Read configured color properties and require their expected values."""
+
+    unknown = settings.keys() - _COLOR_SETTING_PROPERTIES.keys()
+    if unknown:
+        names = ", ".join(sorted(unknown))
+        raise ValueError(f"Unknown Orbbec color settings: {names}.")
+
+    actual_settings: dict[str, bool | int] = {}
     for name, (property_id, value_type) in _COLOR_SETTING_PROPERTIES.items():
         if name not in settings:
             continue
         expected = settings[name]
+        if not device.is_property_supported(property_id, ob.OBPermissionType.PERMISSION_READ):
+            raise RuntimeError(f"Orbbec device does not support reading color setting `{name}`.")
         if value_type is bool:
             actual = device.get_bool_property(property_id)
         else:
@@ -120,8 +151,9 @@ def set_device_color_settings(
                 f"Orbbec color setting `{name}` changed to {actual} after configuration, "
                 f"expected {expected}."
             )
+        actual_settings[name] = actual
 
-    return applied
+    return actual_settings
 
 
 def _format_name(value: Any) -> str:
@@ -227,10 +259,10 @@ class OrbbecColorStream:
         ob.OBFormat.UYVY,
     )
 
-    def __init__(self, serial_number_or_name: str):
+    def __init__(self, serial_number_or_name: str, context: Any | None = None):
         self.serial_number_or_name = serial_number_or_name
         self.serial_number: str | None = None
-        self._context: Any | None = None
+        self._context: Any | None = context
         self._device: Any | None = None
         self._pipeline: Any | None = None
         self._config: Any | None = None
@@ -244,7 +276,8 @@ class OrbbecColorStream:
         if self.is_started:
             raise RuntimeError("Orbbec color stream is already started.")
 
-        self._context = ob.Context()
+        if self._context is None:
+            self._context = ob.Context()
         self._device, record = _select_device(self._context, self.serial_number_or_name)
         self.serial_number = record["serial_number"]
         self._pipeline = ob.Pipeline(self._device)
@@ -301,7 +334,9 @@ class OrbbecColorStream:
 
         return ColorProfile(width, height, fps, _format_name(selected.get_format()))
 
-    def read_rgb(self, *, timeout_ms: int) -> NDArray[np.uint8] | None:
+    def read_frame(self, *, timeout_ms: int) -> ColorFrame | None:
+        """Return one detached RGB frame and metadata from the same SDK frame."""
+
         if not self.is_started or self._pipeline is None:
             raise RuntimeError("Orbbec color stream is not started.")
 
@@ -311,7 +346,19 @@ class OrbbecColorStream:
         frame = frames.get_color_frame()
         if frame is None:
             return None
-        return self._frame_to_rgb(frame)
+        return ColorFrame(
+            image=self._frame_to_rgb(frame),
+            frame_index=int(frame.get_index()),
+            # global_timestamp_us=int(frame.get_global_timestamp_us()),
+            device_timestamp_us=int(frame.get_timestamp_us()),
+            system_timestamp_us=int(frame.get_system_timestamp_us()),
+        )
+
+    def read_rgb(self, *, timeout_ms: int) -> NDArray[np.uint8] | None:
+        """Return one RGB image while preserving the legacy stream API."""
+
+        frame = self.read_frame(timeout_ms=timeout_ms)
+        return None if frame is None else frame.image
 
     def set_color_settings(
         self,
@@ -322,6 +369,23 @@ class OrbbecColorStream:
         if not self.is_started or self._device is None:
             raise RuntimeError("Orbbec color stream is not started.")
         return set_device_color_settings(self._device, settings)
+
+    def verify_color_settings(
+        self,
+        settings: Mapping[str, bool | int],
+    ) -> dict[str, bool | int]:
+        """Read color controls and require their configured values."""
+
+        if not self.is_started or self._device is None:
+            raise RuntimeError("Orbbec color stream is not started.")
+        return verify_device_color_settings(self._device, settings)
+
+    def synchronize_clock_with_host(self) -> None:
+        """Synchronize this stream's device clock with the host clock."""
+
+        if not self.is_started or self._device is None:
+            raise RuntimeError("Orbbec color stream is not started.")
+        self._device.timer_sync_with_host()
 
     @staticmethod
     def _frame_to_rgb(frame: Any) -> NDArray[np.uint8]:

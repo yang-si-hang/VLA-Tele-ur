@@ -2,11 +2,12 @@
 
 ``OrbbecCameraConfig`` is registered under the ``orbbec`` camera type and
 describes device selection, the exact RGB stream profile, output rotation,
-warmup time, and optional color controls. Validation normalizes enum values and
-rejects inconsistent manual and automatic camera settings before the SDK stream
+warmup time, frame-rate monitoring, and optional color controls. Validation
+normalizes enum values and rejects inconsistent settings before the SDK stream
 is opened.
 """
 
+import math
 from dataclasses import dataclass
 
 from lerobot.cameras.configs import CameraConfig, ColorMode, Cv2Rotation
@@ -36,6 +37,8 @@ class OrbbecCameraConfig(CameraConfig):
     color_mode: ColorMode = ColorMode.RGB
     rotation: Cv2Rotation = Cv2Rotation.NO_ROTATION
     warmup_s: float = 1.0
+    frame_rate_warning_ratio: float = 0.95
+    frame_rate_check_interval_s: float = 1.0
 
     auto_exposure: bool | None = False
     exposure: int | None = None
@@ -46,6 +49,7 @@ class OrbbecCameraConfig(CameraConfig):
     anti_flicker: bool | None = False
     power_line_frequency: int | None = 1
     backlight_compensation: int | None = 0
+    # brightness 等参数没有固定, 但是应该在不同的采集中大致相同, 需要采集后检查
 
     def __post_init__(self) -> None:
         self.color_mode = ColorMode(self.color_mode)
@@ -64,6 +68,10 @@ class OrbbecCameraConfig(CameraConfig):
             raise ValueError("`warmup_s` must be a non-negative number.")
         if self.warmup_s < 0:
             raise ValueError("`warmup_s` must be non-negative.")
+        if not math.isfinite(self.frame_rate_warning_ratio) or not 0 < self.frame_rate_warning_ratio <= 1:
+            raise ValueError("`frame_rate_warning_ratio` must be finite and in (0, 1].")
+        if not math.isfinite(self.frame_rate_check_interval_s) or self.frame_rate_check_interval_s <= 0:
+            raise ValueError("`frame_rate_check_interval_s` must be finite and positive.")
 
         for field_name in ("auto_exposure", "auto_white_balance", "anti_flicker"):
             value = getattr(self, field_name)
@@ -93,6 +101,8 @@ class OrbbecCameraConfig(CameraConfig):
 
         self.serial_number_or_name = self.serial_number_or_name.strip()
         self.warmup_s = float(self.warmup_s)
+        self.frame_rate_warning_ratio = float(self.frame_rate_warning_ratio)
+        self.frame_rate_check_interval_s = float(self.frame_rate_check_interval_s)
 
     @property
     def color_settings(self) -> dict[str, bool | int]:
