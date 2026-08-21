@@ -2,9 +2,10 @@
 """Run an OpenPI policy server as a closed-loop controller for a UR robot.
 
 Requires a reachable policy server, UR robot, and two Gemini cameras. The script
-commands the robot and can record a LeRobot dataset episode.
+commands the robot and can record a LeRobot dataset episode, optionally including
+the single base-frame policy delta action used at each control timestep.
 Set --action-sampling-factor above 1 to interpolate and send actions faster than
-policy inference. Example: python scripts/inference/pi05_inference.py --control-fps 20 --action-sampling-factor 3
+policy inference. Example: python scripts/inference/pi05_inference.py --record-policy-delta-action
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ from lerobot_robot_ur.ur import GRIPPER_FEATURE, TCP_FEATURES
 from openpi_client import image_tools, websocket_client_policy
 
 from scripts.openpi.ur_action_adapter import (
+    DELTA_ACTIONS_KEY,
     UR_ACTION_DIM,
     create_absolute_action_broker,
     create_rtc_action_broker,
@@ -36,7 +38,6 @@ from utils.const import DATA_PATH
 from utils.ur_action_utils import interpolate_actions
 
 # state 慢于 action 两个step，理论上只慢一个step，原因需要查找
-# 采集帧率 20Hz 不够, 感觉可能至少得 30Hz (或者降低运动速度)
 
 POLICY_HOST = "127.0.0.1"
 POLICY_PORT = 8000
@@ -83,7 +84,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--execution-horizon", type=int, default=DEFAULT_EXECUTION_HORIZON)
     parser.add_argument("--warmup-inferences", type=int, default=2)
     parser.add_argument("--control-fps", type=float, default=DEFAULT_CONTROL_FPS)
-    parser.add_argument("--action-sampling-factor", type=int, default=10, help="Number of evenly spaced robot actions sent per policy control period")
+    parser.add_argument("--action-sampling-factor", type=int, default=25, help="Number of evenly spaced robot actions sent per policy control period")
     parser.add_argument("--use-rtc", default=False, action=argparse.BooleanOptionalAction, help="Use RTC action broker instead of absolute action broker")
     parser.add_argument("--prefix-len", type=int, default=2)
     parser.add_argument("--decay-end", type=int, default=4)
@@ -91,6 +92,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--start-immediately", action="store_true", help="Skip the interactive safety confirmation before sending actions")
 
     parser.add_argument("--record", action=argparse.BooleanOptionalAction, default=True, help="Record one LeRobot Dataset episode during policy execution")
+    parser.add_argument("--record-policy-delta-action", default=True, action=argparse.BooleanOptionalAction, help="Record the single policy delta action in the robot base frame at each control timestep")
     parser.add_argument("--repo-id", default=f"pi05_pick_{timestamp}")
     parser.add_argument("--dataset-dir", type=Path, default=DATA_PATH / "deploy")
     parser.add_argument("--image-writer-threads-per-camera", type=int, default=4)
@@ -264,6 +266,7 @@ def create_recording_dataset(
     root: Path,
     fps: int,
     image_writer_threads_per_camera: int,
+    record_policy_delta_action: bool = False,
 ) -> LeRobotDataset:
     """Create an image-based LeRobot Dataset for one policy-control session."""
 
@@ -288,6 +291,8 @@ def create_recording_dataset(
         "observation.images.left_wrist_0_rgb": image_feature,
         "observation.images.base_0_rgb": image_feature.copy(),
     }
+    if record_policy_delta_action:
+        features["debug.delta_action"] = vector_feature.copy()
     return LeRobotDataset.create(
         repo_id=repo_id,
         fps=fps,
@@ -306,28 +311,30 @@ def add_recording_frame(
     policy_observation: dict[str, object],
     sent_action: dict[str, object],
     capture_time_s: float,
+    policy_delta_action: np.ndarray | None = None,
 ) -> None:
     """Record the pre-action observation and the action actually sent to the UR."""
 
-    dataset.add_frame(
-        {
-            "observation.state": np.asarray(
-                policy_observation["observation.state"],
-                dtype=np.float32,
-            ).copy(),
-            "observation.images.base_0_rgb": np.asarray(
-                policy_observation["observation.images.base_0_rgb"],
-                dtype=np.uint8,
-            ).copy(),
-            "observation.images.left_wrist_0_rgb": np.asarray(
-                policy_observation["observation.images.left_wrist_0_rgb"],
-                dtype=np.uint8,
-            ).copy(),
-            "action": robot_observation_to_state(sent_action),
-            "debug.capture_time": np.asarray([capture_time_s], dtype=np.float32),
-            "task": str(policy_observation["prompt"]),
-        }
-    )
+    frame = {
+        "observation.state": np.asarray(
+            policy_observation["observation.state"],
+            dtype=np.float32,
+        ).copy(),
+        "observation.images.base_0_rgb": np.asarray(
+            policy_observation["observation.images.base_0_rgb"],
+            dtype=np.uint8,
+        ).copy(),
+        "observation.images.left_wrist_0_rgb": np.asarray(
+            policy_observation["observation.images.left_wrist_0_rgb"],
+            dtype=np.uint8,
+        ).copy(),
+        "action": robot_observation_to_state(sent_action),
+        "debug.capture_time": np.asarray([capture_time_s], dtype=np.float32),
+        "task": str(policy_observation["prompt"]),
+    }
+    if policy_delta_action is not None:
+        frame["debug.delta_action"] = np.asarray(policy_delta_action, dtype=np.float32).copy()
+    dataset.add_frame(frame)
 
 
 def capture_policy_observation(
@@ -363,6 +370,7 @@ def run_control_loop(
     action_sampling_factor: int,
     camera_max_age_ms: int,
     dataset: LeRobotDataset | None = None,
+    record_policy_delta_action: bool = False,
 ) -> None:
     """Observe and infer at control FPS, sending interpolated actions faster."""
 
@@ -392,8 +400,19 @@ def run_control_loop(
         infer_elapsed_s = time.perf_counter() - infer_start
         if "actions" not in result:
             raise RuntimeError("Policy result does not contain actions")
+        if record_policy_delta_action and DELTA_ACTIONS_KEY not in result:
+            raise RuntimeError(f"Policy result does not contain {DELTA_ACTIONS_KEY}")
 
         target_action = np.asarray(result["actions"], dtype=np.float32)
+        if target_action.shape != (UR_ACTION_DIM,) or not np.all(np.isfinite(target_action)):
+            raise RuntimeError(f"Expected one finite absolute policy action with shape ({UR_ACTION_DIM},), got {target_action.shape}")
+        delta_action = (
+            np.asarray(result[DELTA_ACTIONS_KEY], dtype=np.float32)
+            if record_policy_delta_action
+            else None
+        )
+        if delta_action is not None and (delta_action.shape != (UR_ACTION_DIM,) or not np.all(np.isfinite(delta_action))):
+            raise RuntimeError(f"Expected one finite delta policy action with shape ({UR_ACTION_DIM},), got {delta_action.shape}")
         start_action = (
             robot_observation_to_state(robot_observation)
             if previous_policy_action is None
@@ -413,6 +432,7 @@ def run_control_loop(
                 policy_observation,
                 sent_action,
                 capture_time_s,
+                policy_delta_action=delta_action,
             )
 
         step += 1
@@ -492,6 +512,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             root=args.dataset_dir / f"{args.repo_id}",
             fps=int(args.control_fps),
             image_writer_threads_per_camera=args.image_writer_threads_per_camera,
+            record_policy_delta_action=args.record_policy_delta_action,
         )
         print(f"Recording dataset to {dataset.root}")
 
@@ -562,6 +583,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 action_sampling_factor=args.action_sampling_factor,
                 camera_max_age_ms=args.camera_max_age_ms,
                 dataset=dataset,
+                record_policy_delta_action=args.record_policy_delta_action,
             )
         except KeyboardInterrupt:
             print("Stop requested")

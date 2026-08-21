@@ -12,7 +12,7 @@ session. Dataset recording and Sigma-to-UR coupling are independent states:
 
 * c couples Sigma to UR after capturing fresh relative-pose references.
 * d decouples Sigma from UR without disconnecting either device.
-* s selects a candidate task and starts an episode while teleoperation is coupled.
+* s opens candidate-task selection; enter its number and press Enter to start.
 * n saves the current episode and leaves teleoperation coupled for reset.
 * r discards the current episode and leaves teleoperation coupled for reset.
 * q saves a non-empty active episode and shuts down the session.
@@ -35,7 +35,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, auto
 from pathlib import Path
@@ -232,6 +232,12 @@ KEY_COMMANDS = {
 
 
 @dataclass(frozen=True, slots=True)
+class TaskSelectionKey:
+    name: str
+    captured_at: float = field(default_factory=time.perf_counter)
+
+
+@dataclass(frozen=True, slots=True)
 class EpisodeBoundary:
     save: bool
     frame_count: int
@@ -275,64 +281,23 @@ _WRITER_SENTINEL = object()
 _SAMPLER_SENTINEL = object()
 
 
-def _flush_pending_stdin() -> None:
-    """Discard hotkeys left in the terminal input buffer before a prompt."""
-
-    if not sys.stdin.isatty():
-        return
-    try:
-        import termios
-    except ImportError:
-        return
-    with contextlib.suppress(OSError, termios.error):
-        termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
-
-
-def select_candidate_task(
-    candidate_tasks: Sequence[str],
-    *,
-    input_fn: Callable[[str], str] = input,
-    flush_input_fn: Callable[[], None] = _flush_pending_stdin,
-) -> str:
-    """Prompt the operator to select one task by its one-based index."""
-
-    if not candidate_tasks:
-        raise ValueError("Candidate task set must not be empty")
-
-    print("Candidate tasks:")
-    for index, candidate_task in enumerate(candidate_tasks, start=1):
-        print(f"  {index}. {candidate_task}")
-
-    flush_input_fn()
-    while True:
-        response = input_fn(
-            f"Select task for the next episode [1-{len(candidate_tasks)}]: "
-        ).strip()
-        try:
-            selected_index = int(response)
-        except ValueError:
-            print("Invalid task index. Enter a number from the list.")
-            continue
-        if 1 <= selected_index <= len(candidate_tasks):
-            return candidate_tasks[selected_index - 1]
-        print("Task index is out of range.")
-
-
 def handle_session_key(
     name: str,
-    command_queue: queue.SimpleQueue[SessionCommand],
+    command_queue: queue.SimpleQueue[SessionCommand | TaskSelectionKey],
 ) -> None:
     """Translate one keyboard event into a session command."""
 
     command = KEY_COMMANDS.get(name.lower())
     if command is not None:
         command_queue.put(command)
+    elif name.isdigit() or name in {"enter", "backspace"}:
+        command_queue.put(TaskSelectionKey(name))
 
 
 def _get_pending_commands(
-    command_queue: queue.SimpleQueue[SessionCommand],
-) -> list[SessionCommand]:
-    commands: list[SessionCommand] = []
+    command_queue: queue.SimpleQueue[SessionCommand | TaskSelectionKey],
+) -> list[SessionCommand | TaskSelectionKey]:
+    commands: list[SessionCommand | TaskSelectionKey] = []
     while True:
         try:
             commands.append(command_queue.get_nowait())
@@ -347,7 +312,7 @@ def run_continuous_session(
     teleop: Sigma,
     mapper: SigmaRelativeURActionStep,
     dataset: LeRobotDataset,
-    command_queue: queue.SimpleQueue[SessionCommand],
+    command_queue: queue.SimpleQueue[SessionCommand | TaskSelectionKey],
     num_episodes: int,
     control_fps: int,
     dataset_fps: int,
@@ -360,7 +325,7 @@ def run_continuous_session(
     robot_observation_processor: RobotProcessorPipeline,
     frequency_warning_ratio: float = DEFAULT_FREQUENCY_WARNING_RATIO,
     capture_references: Callable[..., None] = capture_episode_references,
-    task_selector: Callable[[Sequence[str]], str] = select_candidate_task,
+    task_selector: Callable[[Sequence[str]], str] | None = None,
 ) -> int:
     """Run teleoperation continuously and gate dataset writes by episode state."""
 
@@ -575,6 +540,8 @@ def run_continuous_session(
     discarded_episodes = 0
     episode_start_t: float | None = None
     episode_task: str | None = None
+    task_selection_buffer = ""
+    task_selection_started_at = 0.0
     episode_generation = 0
     sampling_started_generation: int | None = None
     control_sequence = 0
@@ -596,7 +563,21 @@ def run_continuous_session(
         next_control_t = time.perf_counter()
 
     def start_task_selection() -> None:
-        nonlocal episode_state
+        nonlocal episode_state, task_selection_buffer, task_selection_started_at
+
+        task_selection_buffer = ""
+        task_selection_started_at = time.perf_counter()
+        episode_state = EpisodeState.SELECTING_TASK
+        print("Candidate tasks:")
+        for index, candidate_task in enumerate(resolved_candidate_tasks, start=1):
+            print(f"  {index}. {candidate_task}")
+        print(
+            f"Select task for the next episode [1-{len(resolved_candidate_tasks)}], "
+            "then press Enter:"
+        )
+
+        if task_selector is None:
+            return
 
         def select_task_worker() -> None:
             try:
@@ -604,13 +585,62 @@ def run_continuous_session(
             except BaseException as exc:
                 task_selection_results.put(exc)
 
-        episode_state = EpisodeState.SELECTING_TASK
         task_selection_thread = threading.Thread(
             target=select_task_worker,
             name="ur10e-episode-task-selection",
             daemon=True,
         )
         task_selection_thread.start()
+
+    def confirm_task_selection(selected_index: int) -> None:
+        nonlocal episode_state, episode_task
+        nonlocal episode_start_t, episode_generation
+        nonlocal sampling_started_generation, control_frequency_monitor
+
+        episode_task = resolved_candidate_tasks[selected_index - 1]
+        log_say(f"Selected task {selected_index}: {episode_task}")
+        capture_current_references(
+            "Hold Sigma still while episode references are captured"
+        )
+        control_frequency_monitor = FrequencyMonitor(
+            name="Teleoperation control",
+            target_hz=control_fps,
+            warning_ratio=frequency_warning_ratio,
+        )
+        episode_generation += 1
+        sampling_started_generation = None
+        episode_start_t = time.perf_counter()
+        episode_state = EpisodeState.RECORDING
+        log_say(
+            f"Recording episode {recorded_episodes + 1} of "
+            f"{num_episodes}. Press n to save, r to discard, "
+            "d to decouple and discard, or q to quit"
+        )
+
+    def process_task_selection_key(name: str) -> None:
+        nonlocal task_selection_buffer
+
+        if episode_state is not EpisodeState.SELECTING_TASK:
+            return
+        if name.isdigit():
+            task_selection_buffer += name
+            print(f"Task selection: {task_selection_buffer}")
+            return
+        if name == "backspace":
+            task_selection_buffer = task_selection_buffer[:-1]
+            print(f"Task selection: {task_selection_buffer or '(empty)'}")
+            return
+        if name != "enter":
+            return
+        if not task_selection_buffer:
+            print("Task selection is empty. Enter a task number, then press Enter.")
+            return
+        selected_index = int(task_selection_buffer)
+        task_selection_buffer = ""
+        if not 1 <= selected_index <= len(resolved_candidate_tasks):
+            print("Task index is out of range. Enter a number from the list.")
+            return
+        confirm_task_selection(selected_index)
 
     def process_task_selection() -> None:
         nonlocal episode_state, episode_task
@@ -635,26 +665,8 @@ def run_continuous_session(
             )
             return
 
-        episode_task = result
-        selected_task_index = resolved_candidate_tasks.index(episode_task) + 1
-        log_say(f"Selected task {selected_task_index}: {episode_task}")
-        capture_current_references(
-            "Hold Sigma still while episode references are captured"
-        )
-        control_frequency_monitor = FrequencyMonitor(
-            name="Teleoperation control",
-            target_hz=control_fps,
-            warning_ratio=frequency_warning_ratio,
-        )
-        episode_generation += 1
-        sampling_started_generation = None
-        episode_start_t = time.perf_counter()
-        episode_state = EpisodeState.RECORDING
-        log_say(
-            f"Recording episode {recorded_episodes + 1} of "
-            f"{num_episodes}. Press n to save, r to discard, "
-            "d to decouple and discard, or q to quit"
-        )
+        selected_task_index = resolved_candidate_tasks.index(result) + 1
+        confirm_task_selection(selected_task_index)
 
     def start_sampling_if_needed() -> None:
         nonlocal sampling_started_generation
@@ -747,6 +759,11 @@ def run_continuous_session(
                 ) from sampling_errors[0]
 
             for command in _get_pending_commands(command_queue):
+                if isinstance(command, TaskSelectionKey):
+                    if command.captured_at >= task_selection_started_at:
+                        process_task_selection_key(command.name)
+                    continue
+
                 if command is SessionCommand.QUIT:
                     if episode_state is EpisodeState.RECORDING:
                         log_say("Quit requested. Saving the active episode")
@@ -786,6 +803,9 @@ def run_continuous_session(
                         logging.info(
                             "Teleoperation disabled while task selection is pending"
                         )
+                        episode_state = EpisodeState.IDLE
+                        task_selection_buffer = ""
+                        log_say("Task selection cancelled")
                     if teleop_state is TeleoperationState.ENABLED:
                         teleop_state = TeleoperationState.DISABLED
                         mapper.clear_reference()
@@ -999,7 +1019,7 @@ def run(args: argparse.Namespace) -> LeRobotDataset:
         rgb_encoder=RGBEncoderConfig(vcodec="h264"),
     )
 
-    command_queue: queue.SimpleQueue[SessionCommand] = queue.SimpleQueue()
+    command_queue: queue.SimpleQueue[SessionCommand | TaskSelectionKey] = queue.SimpleQueue()
     listener = create_key_listener(
         lambda key: handle_session_key(key, command_queue),
         controls_help=(

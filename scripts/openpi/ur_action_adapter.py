@@ -10,6 +10,7 @@ from scipy.spatial.transform import Rotation
 from typing_extensions import override
 
 UR_ACTION_DIM = 10
+DELTA_ACTIONS_KEY = "delta_actions"
 
 
 def rotation_to_rot6d(rotation: Rotation) -> np.ndarray:
@@ -73,6 +74,33 @@ def relative_actions_to_absolute(state: np.ndarray, actions: np.ndarray) -> np.n
     return absolute_actions.astype(output_dtype, copy=False)
 
 
+def tcp_relative_actions_to_base_relative(state: np.ndarray, actions: np.ndarray) -> np.ndarray:
+    """Express TCP-frame relative actions in the robot base frame."""
+
+    state_values = np.asarray(state, dtype=np.float64)
+    action_array = np.asarray(actions)
+    action_values = np.asarray(actions, dtype=np.float64)
+    if state_values.shape != (UR_ACTION_DIM,):
+        raise ValueError(f"UR state must have shape ({UR_ACTION_DIM},), got {state_values.shape}")
+    if action_values.ndim == 0 or action_values.shape[-1] != UR_ACTION_DIM:
+        raise ValueError(f"UR actions must have last dimension {UR_ACTION_DIM}, got {action_values.shape}")
+    if not np.all(np.isfinite(state_values)) or not np.all(np.isfinite(action_values)):
+        raise ValueError("UR state and action values must be finite")
+
+    current_rotation = rot6d_to_rotation(state_values[3:9])
+    current_rotation_inverse = current_rotation.inv()
+    base_relative_actions = action_values.copy()
+    flat_actions = action_values.reshape(-1, UR_ACTION_DIM)
+    flat_base_relative_actions = base_relative_actions.reshape(-1, UR_ACTION_DIM)
+    for index, relative in enumerate(flat_actions):
+        relative_rotation = rot6d_to_rotation(relative[3:9])
+        flat_base_relative_actions[index, :3] = current_rotation.apply(relative[:3])
+        flat_base_relative_actions[index, 3:9] = rotation_to_rot6d(current_rotation * relative_rotation * current_rotation_inverse)
+
+    output_dtype = action_array.dtype if np.issubdtype(action_array.dtype, np.floating) else np.dtype(np.float32)
+    return base_relative_actions.astype(output_dtype, copy=False)
+
+
 class RelativeTCPToAbsolutePolicy(_base_policy.BasePolicy):
     """Convert a complete relative policy chunk before it reaches the action broker."""
 
@@ -93,7 +121,11 @@ class RelativeTCPToAbsolutePolicy(_base_policy.BasePolicy):
             raise ValueError(
                 f"Expected policy actions with shape ({self._prediction_horizon}, {UR_ACTION_DIM}), got {actions.shape}"
             )
-        return {**result, "actions": relative_actions_to_absolute(state, actions)}
+        return {
+            **result,
+            "actions": relative_actions_to_absolute(state, actions),
+            DELTA_ACTIONS_KEY: tcp_relative_actions_to_base_relative(state, actions),
+        }
 
     @override
     def reset(self) -> None:
@@ -122,7 +154,7 @@ class RTCActionChunkBroker(_base_policy.BasePolicy):
         prefix_len: int,
         decay_end: int | None = None,
         schedule: str = "exp",
-        max_guidance_weight: float = 5.0,
+        max_guidance_weight: float = 5.0,       # VJP max guidance weight
         use_vjp: bool = False,
     ):
         if prediction_horizon <= 0:
