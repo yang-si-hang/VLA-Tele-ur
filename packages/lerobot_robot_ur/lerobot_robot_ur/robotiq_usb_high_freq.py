@@ -206,6 +206,35 @@ class RobotiqGripperUSBHighFrequency:
             raise TimeoutError("Robotiq FC23 worker did not initialize in time")
         self._raise_if_failed()
 
+    def recalibrate(self) -> GripperState:
+        """Reset, clear faults, and reactivate without starting runtime control."""
+
+        if self._serial is not None:
+            raise RuntimeError("Robotiq gripper is already connected")
+        self._reset_runtime_state()
+        ser = serial.Serial(
+            port=self.port,
+            baudrate=self.baudrate,
+            bytesize=serial.EIGHTBITS,
+            parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_ONE,
+            timeout=self.serial_timeout_s,
+            write_timeout=self.serial_timeout_s,
+        )
+        self._serial = ser
+        try:
+            ser.reset_input_buffer()
+            ser.reset_output_buffer()
+            self._write_control_io(0x00, 0, 0, 0)
+            self._wait_for_activation_state(False)
+            self._write_control_io(0x01, 0, 0, 0)
+            self._wait_for_activation_state(True, require_fault_clear=True)
+            return self.get_state()
+        finally:
+            if ser.is_open:
+                ser.close()
+            self._serial = None
+
     def disconnect(self) -> None:
         """Stop the worker and close the serial port."""
 
@@ -389,14 +418,14 @@ class RobotiqGripperUSBHighFrequency:
         self._write_control_io(0x01, 0, 0, 0)
         self._wait_for_activation_state(True)
 
-    def _wait_for_activation_state(self, active: bool) -> None:
+    def _wait_for_activation_state(self, active: bool, *, require_fault_clear: bool = False) -> None:
         deadline = time.monotonic() + self.activation_timeout_s
         while True:
             state = self._read_state_io()
             self._publish_state(replace(state, sequence=0))
             if active and state.fault not in (0x00, 0x09):
                 raise RuntimeError(f"Robotiq activation fault 0x{state.fault:02X}")
-            if active and state.activated and state.gripper_status == GripperStatus.ACTIVE:
+            if active and state.activated and state.gripper_status == GripperStatus.ACTIVE and (not require_fault_clear or state.fault == 0):
                 return
             if not active and not state.activated and state.gripper_status == GripperStatus.RESET:
                 return

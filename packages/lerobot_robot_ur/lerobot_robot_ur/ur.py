@@ -150,6 +150,38 @@ class URRobot(Robot):
         return sent_action
 
     @check_if_not_connected
+    def send_trajectory_action(
+        self,
+        action: RobotAction,
+        current_observation: RobotObservation,
+        *,
+        transition_duration_s: float,
+        step_limit_check: bool = True,
+    ) -> RobotAction:
+        """Publish one policy target for interpolation by the RTDE servo thread."""
+
+        requested_pose = self._extract_tcp_pose(action)
+        requested_gripper: float | None = None
+        if self.config.use_gripper:
+            if GRIPPER_FEATURE not in action:
+                raise ValueError(f"Action is missing required key: {GRIPPER_FEATURE}")
+            requested_gripper = self._finite_float(action[GRIPPER_FEATURE], GRIPPER_FEATURE)
+            requested_gripper = float(np.clip(requested_gripper, 0.0, 1.0))
+
+        current_pose = self._extract_tcp_pose(current_observation)
+        safe_pose = self._limit_tcp_step(current_pose, requested_pose) if step_limit_check else requested_pose
+        sent_pose = self.ur_control.submit_tcp_pose_trajectory(
+            current_pose,
+            safe_pose,
+            duration_s=transition_duration_s,
+        )
+        sent_action = self._tcp_pose_to_features(sent_pose)
+
+        if requested_gripper is not None:
+            sent_action[GRIPPER_FEATURE] = self._send_gripper_position(requested_gripper)
+        return sent_action
+
+    @check_if_not_connected
     def move_to_action(self, action: RobotAction, *, speed: float = 0.25, acceleration: float = 0.5) -> RobotAction:
         """Move linearly to one absolute action pose before streamed control."""
 

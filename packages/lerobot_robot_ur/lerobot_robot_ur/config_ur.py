@@ -28,7 +28,7 @@ class URRobotConfig(RobotConfig):
     gripper_max_consecutive_errors: int = 3
     gripper_speed: int = 255
     gripper_force: int = 150
-    gripper_cache_max_age_s: float = 0.1
+    gripper_cache_max_age_s: float = 0.1    # 读取 Gripper 的最大缓存时间
 
     # ``None`` lets ur_rtde select the controller's native frequency
     # (typically 500 Hz for e-Series and 125 Hz for CB-Series).

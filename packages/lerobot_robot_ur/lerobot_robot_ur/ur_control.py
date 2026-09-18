@@ -15,14 +15,13 @@ import math
 import queue
 import threading
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Sequence
 
 import numpy as np
 import rtde_control
 import rtde_receive
-from scipy.spatial.transform import Rotation
-
+from scipy.spatial.transform import Rotation, Slerp
 
 logger = logging.getLogger(__name__)
 
@@ -75,14 +74,55 @@ class _MoveLCommand(_PoseCommand):
     acceleration: float = 0.5
 
 
+@dataclass(slots=True)
+class _TrajectoryCommand:
+    start_pose: list[float]
+    target_pose: list[float]
+    duration_s: float
+
+
+@dataclass(slots=True)
+class _PoseTrajectory:
+    start_position: np.ndarray
+    target_position: np.ndarray
+    rotation_slerp: Slerp
+    start_time: float
+    duration_s: float
+
+    @classmethod
+    def create(
+        cls,
+        start_pose: Sequence[float],
+        target_pose: Sequence[float],
+        *,
+        start_time: float,
+        duration_s: float,
+    ) -> _PoseTrajectory:
+        start = np.asarray(start_pose, dtype=np.float64)
+        target = np.asarray(target_pose, dtype=np.float64)
+        rotations = Rotation.from_rotvec(np.stack((start[3:], target[3:])))
+        return cls(
+            start_position=start[:3].copy(),
+            target_position=target[:3].copy(),
+            rotation_slerp=Slerp([0.0, 1.0], rotations),
+            start_time=start_time,
+            duration_s=duration_s,
+        )
+
+    def evaluate(self, current_time: float) -> list[float]:
+        alpha = float(np.clip((current_time - self.start_time) / self.duration_s, 0.0, 1.0))
+        position = self.start_position + alpha * (self.target_position - self.start_position)
+        rotation_vector = self.rotation_slerp([alpha])[0].as_rotvec()
+        return [*position.tolist(), *rotation_vector.tolist()]
+
+
 class URControl:
     """Own RTDE control/receive interfaces and stream TCP targets.
 
     ``RTDEControlInterface`` is not thread-safe. All of its runtime control
-    methods are therefore confined to the servo thread. Public callers submit
-    commands through a capacity-one FIFO queue. A queued command is never
-    replaced by a newer command: producers wait for queue space, then wait until
-    the command's first ``servoL`` call has been acknowledged.
+    methods are therefore confined to the servo thread. Immediate commands use
+    a capacity-one FIFO queue, while interpolated policy targets use a
+    non-blocking latest-target slot.
     """
 
     def __init__(
@@ -108,12 +148,9 @@ class URControl:
 
         self._rtde_c = None
         self._rtde_r = None
-        # Future streaming design: replace this FIFO with a lock-protected
-        # latest-target slot so a new servo target supersedes a pending stale
-        # target. Give commands sequence IDs and explicitly acknowledge executed
-        # versus superseded commands so synchronous callers cannot wait forever
-        # or mistake another target's servoL acknowledgement for their own.
         self._command_queue: queue.Queue[_PoseCommand | _MoveLCommand] = queue.Queue(maxsize=1)
+        self._trajectory_lock = threading.Lock()
+        self._pending_trajectory: _TrajectoryCommand | None = None
         self._stop_event = threading.Event()
         self._thread_started = threading.Event()
         self._control_thread: threading.Thread | None = None
@@ -200,6 +237,24 @@ class URControl:
         self._raise_if_thread_failed()
         return target
 
+    def submit_tcp_pose_trajectory(
+        self,
+        start_pose: Sequence[float],
+        target_pose: Sequence[float],
+        *,
+        duration_s: float,
+    ) -> list[float]:
+        """Publish the latest time-interpolated pose target without blocking."""
+
+        self._require_connected()
+        start = self._validate_pose(start_pose, name="trajectory start TCP pose")
+        target = self._validate_pose(target_pose, name="trajectory target TCP pose")
+        if not math.isfinite(duration_s) or duration_s <= 0:
+            raise ValueError("Trajectory duration must be finite and positive")
+        with self._trajectory_lock:
+            self._pending_trajectory = _TrajectoryCommand(start, target, float(duration_s))
+        return target
+
     def move_tcp_pose(self, pose: Sequence[float], *, speed: float = 0.25, acceleration: float = 0.5) -> list[float]:
         """Move linearly to one TCP pose with RTDE moveL."""
 
@@ -266,6 +321,7 @@ class URControl:
 
     def _servo_loop(self) -> None:
         active_pose: list[float] | None = None
+        active_trajectory: _PoseTrajectory | None = None
         last_command_time: float | None = None
         servo_active = False
         current_command: _PoseCommand | None = None
@@ -285,6 +341,7 @@ class URControl:
                         self._rtde_c.servoStop()
                     servo_active = False
                     active_pose = None
+                    active_trajectory = None
                     last_command_time = None
                     if (
                         self.check_pose_safety
@@ -303,7 +360,14 @@ class URControl:
                     current_command = None
                     continue
 
+                trajectory_command = None
+                if current_command is None:
+                    with self._trajectory_lock:
+                        trajectory_command = self._pending_trajectory
+                        self._pending_trajectory = None
+
                 cycle_start = self._rtde_c.initPeriod()
+                current_time = time.monotonic()
                 command_accepted = False
                 if current_command is not None:
                     if current_command.cancelled.is_set():
@@ -321,8 +385,34 @@ class URControl:
                         current_command.done.set()
                     else:
                         active_pose = current_command.pose
-                        last_command_time = time.monotonic()
+                        active_trajectory = None
+                        last_command_time = current_time
                         command_accepted = True
+
+                if trajectory_command is not None:
+                    if (
+                        self.check_pose_safety
+                        and not self._rtde_c.isPoseWithinSafetyLimits(
+                            trajectory_command.target_pose
+                        )
+                    ):
+                        raise ValueError(
+                            "Trajectory target TCP pose is unreachable or outside UR safety limits"
+                        )
+                    if active_trajectory is not None:
+                        trajectory_start_pose = active_trajectory.evaluate(current_time)
+                    elif active_pose is not None:
+                        trajectory_start_pose = active_pose
+                    else:
+                        trajectory_start_pose = trajectory_command.start_pose
+                    active_trajectory = _PoseTrajectory.create(
+                        trajectory_start_pose,
+                        trajectory_command.target_pose,
+                        start_time=current_time,
+                        duration_s=trajectory_command.duration_s,
+                    )
+                    active_pose = trajectory_start_pose
+                    last_command_time = current_time
 
                 if active_pose is not None and last_command_time is not None:
                     if time.monotonic() - last_command_time > self.action_timeout_s:
@@ -330,8 +420,11 @@ class URControl:
                             self._rtde_c.servoStop()
                         servo_active = False
                         active_pose = None
+                        active_trajectory = None
                         last_command_time = None
                     else:
+                        if active_trajectory is not None:
+                            active_pose = active_trajectory.evaluate(current_time)
                         ok = self._rtde_c.servoL(
                             active_pose,
                             0.5,  # speed and acceleration are unused by servoL
@@ -398,6 +491,8 @@ class URControl:
     def _reset_runtime_state(self) -> None:
         self._stop_event.clear()
         self._thread_started.clear()
+        with self._trajectory_lock:
+            self._pending_trajectory = None
         with self._state_lock:
             self._control_connected = False
             self._receive_connected = False
