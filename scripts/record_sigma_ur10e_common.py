@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from functools import cached_property
 from typing import Any, Callable
 
-from lerobot.cameras import CameraConfig, make_cameras_from_configs
+from lerobot.cameras import Camera, CameraConfig, make_cameras_from_configs
 from lerobot.configs import PipelineFeatureType, PolicyFeature
 from lerobot.datasets import (
     aggregate_pipeline_dataset_features,
@@ -21,11 +21,10 @@ from lerobot.processor import RobotActionProcessorStep, RobotProcessorPipeline
 from lerobot.types import RobotAction, RobotObservation
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 from lerobot.utils.feature_utils import combine_feature_dicts
-from scipy.spatial.transform import Rotation
-
 from lerobot_robot_ur import URRobot, URRobotConfig
 from lerobot_robot_ur.ur import GRIPPER_FEATURE, TCP_FEATURES
 from lerobot_teleoperator_sigma import GRIPPER_ANGLE_FEATURE, Sigma
+from scipy.spatial.transform import Rotation
 
 try:
     from scripts.sigma_ur10e_relative_teleop import (
@@ -56,9 +55,10 @@ class CameraAugmentedURRobot(URRobot):
         self,
         config: URRobotConfig,
         camera_configs: dict[str, CameraConfig],
+        cameras: dict[str, Camera] | None = None,
     ) -> None:
         super().__init__(config)
-        self.cameras = make_cameras_from_configs(camera_configs)
+        self.cameras = make_cameras_from_configs(camera_configs) if cameras is None else cameras
 
     @cached_property
     def observation_features(self) -> dict[str, type | tuple[int, int, int]]:
