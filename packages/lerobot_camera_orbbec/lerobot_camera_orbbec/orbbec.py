@@ -72,6 +72,8 @@ class OrbbecCamera(Camera):
         self.serial_number: str | None = None
         self.color_mode = config.color_mode
         self.warmup_s = config.warmup_s
+        self.sync_mode = config.sync_mode
+        self.timestamp_reference = config.timestamp_reference
         self.color_settings = config.color_settings
         self.applied_color_settings: dict[str, bool | int] = {}
         self.frame_rate_warning_ratio = config.frame_rate_warning_ratio
@@ -125,13 +127,15 @@ class OrbbecCamera(Camera):
         return find_orbbec_cameras()
 
     @check_if_already_connected
-    def connect(self, warmup: bool = True) -> None:
+    def connect(self, warmup: bool = True, synchronize_clock: bool = True) -> None:
         stream = OrbbecColorStream(self.serial_number_or_name, context=self._sdk_context)
         try:
             profile = stream.start(
                 width=self.capture_width,
                 height=self.capture_height,
                 fps=self.fps,
+                sync_mode=self.sync_mode,
+                timestamp_reference=self.timestamp_reference,
             )
             self._stream = stream
             self.serial_number = stream.serial_number
@@ -148,10 +152,11 @@ class OrbbecCamera(Camera):
                     f"at {profile.fps} FPS."
                 )
 
-            stream.synchronize_clock_with_host()
+            if synchronize_clock:
+                stream.synchronize_clock_with_host()
             self._start_read_thread()
             if warmup:
-                self._warmup()
+                self.warmup()
                 if self.color_settings:
                     self.applied_color_settings = stream.verify_color_settings(self.color_settings)
             self._reset_frame_rate_monitor()
@@ -185,7 +190,8 @@ class OrbbecCamera(Camera):
             raise RuntimeError(f"{self} has no active Orbbec stream.")
         stream.synchronize_clock_with_host()
 
-    def _warmup(self) -> None:
+    @check_if_not_connected
+    def warmup(self) -> None:
         """Wait for a first frame, then keep consuming during the warmup period."""
 
         deadline = time.perf_counter() + max(5.0, self.warmup_s)

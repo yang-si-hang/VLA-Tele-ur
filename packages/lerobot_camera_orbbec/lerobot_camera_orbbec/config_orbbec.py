@@ -23,7 +23,9 @@ class OrbbecCameraConfig(CameraConfig):
 
     Color controls are optional so existing configurations keep using the
     device defaults. Manual exposure and white balance values must be paired
-    with their corresponding automatic control explicitly disabled.
+    with their corresponding automatic control explicitly disabled. Hardware
+    sync is unchanged when ``sync_mode`` is ``None``. Frame timestamps reference
+    the start of exposure by default.
 
     The default profile (1280x720 at 30 FPS) is supported by both Gemini 305
     and Gemini 336. Stream profiles are matched exactly; unsupported settings
@@ -39,6 +41,8 @@ class OrbbecCameraConfig(CameraConfig):
     warmup_s: float = 1.0
     frame_rate_warning_ratio: float = 0.95
     frame_rate_check_interval_s: float = 1.0
+    sync_mode: str | None = None
+    timestamp_reference: str = "start"
 
     auto_exposure: bool | None = False
     exposure: int | None = None
@@ -72,6 +76,10 @@ class OrbbecCameraConfig(CameraConfig):
             raise ValueError("`frame_rate_warning_ratio` must be finite and in (0, 1].")
         if not math.isfinite(self.frame_rate_check_interval_s) or self.frame_rate_check_interval_s <= 0:
             raise ValueError("`frame_rate_check_interval_s` must be finite and positive.")
+        if self.sync_mode not in (None, "primary", "secondary"):
+            raise ValueError("`sync_mode` must be 'primary', 'secondary', or None.")
+        if self.timestamp_reference not in ("start", "middle", "end"):
+            raise ValueError("`timestamp_reference` must be 'start', 'middle', or 'end'.")
 
         for field_name in ("auto_exposure", "auto_white_balance", "anti_flicker"):
             value = getattr(self, field_name)

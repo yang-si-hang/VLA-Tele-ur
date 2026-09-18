@@ -272,7 +272,7 @@ class OrbbecColorStream:
     def is_started(self) -> bool:
         return self._pipeline is not None and self._profile is not None
 
-    def start(self, *, width: int, height: int, fps: int) -> ColorProfile:
+    def start(self, *, width: int, height: int, fps: int, sync_mode: str | None = None, timestamp_reference: str = "start") -> ColorProfile:
         if self.is_started:
             raise RuntimeError("Orbbec color stream is already started.")
 
@@ -282,6 +282,12 @@ class OrbbecColorStream:
         self.serial_number = record["serial_number"]
         self._pipeline = ob.Pipeline(self._device)
         self._config = ob.Config()
+
+        try:
+            self._configure_synchronization(sync_mode, timestamp_reference)
+        except Exception:
+            self.stop()
+            raise
 
         profile_list = self._pipeline.get_stream_profile_list(ob.OBSensorType.COLOR_SENSOR)
         profiles = _video_profiles(profile_list)
@@ -333,6 +339,52 @@ class OrbbecColorStream:
             ) from exc
 
         return ColorProfile(width, height, fps, _format_name(selected.get_format()))
+
+    def _configure_synchronization(self, sync_mode: str | None, timestamp_reference: str) -> None:
+        self._configure_sync_mode(sync_mode)
+        if sync_mode is not None:
+            self._configure_timestamp_reference(timestamp_reference)
+
+    def _configure_sync_mode(self, sync_mode: str | None) -> None:
+        if sync_mode is None:
+            return
+        if self._device is None:
+            raise RuntimeError("Orbbec device is not selected.")
+        modes = {
+            "primary": (ob.OBMultiDeviceSyncMode.PRIMARY, True),
+            "secondary": (ob.OBMultiDeviceSyncMode.SECONDARY, False),
+        }
+        if sync_mode not in modes:
+            raise ValueError(f"Unsupported Orbbec sync mode: {sync_mode!r}.")
+        mode, trigger_out_enable = modes[sync_mode]
+        config = self._device.get_multi_device_sync_config()
+        config.mode = mode
+        config.color_delay_us = 0
+        config.depth_delay_us = 0
+        config.trigger_to_image_delay_us = 0
+        config.trigger_out_enable = trigger_out_enable
+        config.trigger_out_delay_us = 0
+        config.frames_per_trigger = 1
+        self._device.set_multi_device_sync_config(config)
+        actual = self._device.get_multi_device_sync_config()
+        if actual.mode != mode or actual.trigger_out_enable != trigger_out_enable:
+            raise RuntimeError(f"Orbbec sync mode {sync_mode!r} did not apply: {actual}.")
+
+    def _configure_timestamp_reference(self, timestamp_reference: str) -> None:
+        if self._device is None:
+            raise RuntimeError("Orbbec device is not selected.")
+        values = {"start": 0, "middle": 1, "end": 2}
+        if timestamp_reference not in values:
+            raise ValueError(f"Unsupported Orbbec timestamp reference: {timestamp_reference!r}.")
+        property_id = ob.OBPropertyID.OB_PROP_INTRA_CAMERA_SYNC_REFERENCE_INT
+        for permission, action in ((ob.OBPermissionType.PERMISSION_WRITE, "writing"), (ob.OBPermissionType.PERMISSION_READ, "reading")):
+            if not self._device.is_property_supported(property_id, permission):
+                raise RuntimeError(f"Orbbec device does not support {action} the timestamp reference.")
+        expected = values[timestamp_reference]
+        self._device.set_int_property(property_id, expected)
+        actual = self._device.get_int_property(property_id)
+        if actual != expected:
+            raise RuntimeError(f"Orbbec timestamp reference read back as {actual}, expected {expected} ({timestamp_reference}).")
 
     def read_frame(self, *, timeout_ms: int) -> ColorFrame | None:
         """Return one detached RGB frame and metadata from the same SDK frame."""
